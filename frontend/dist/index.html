@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en" data-theme="zinc">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>SmartTrader</title>
+    <script>
+      // Apply the saved theme before first paint. Mirrors src/lib/theme.ts.
+      (function () {
+        var mode = null;
+        var accent = "zinc";
+        var accents = ["zinc", "green", "blue", "violet", "orange", "slate"];
+        try {
+          var saved = JSON.parse(localStorage.getItem("smarttrader-theme") || "null");
+          if (saved && (saved.mode === "light" || saved.mode === "dark")) mode = saved.mode;
+          if (saved && accents.indexOf(saved.accent) !== -1) accent = saved.accent;
+        } catch (e) {}
+        if (!mode) {
+          try {
+            mode = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+          } catch (e) {
+            mode = "light";
+          }
+        }
+        var root = document.documentElement;
+        if (mode === "dark") root.classList.add("dark");
+        root.setAttribute("data-theme", accent);
+      })();
+    </script>
+    <script type="module" crossorigin src="/assets/index-CLqf0qmU.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-DgGJuggg.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>
