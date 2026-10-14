@@ -57,9 +57,10 @@ deleted.
 
 ## agent_secret
 
-Encrypted credentials for the agent's model provider. Today one row:
-`name = 'chatgpt_oauth'`, the ChatGPT subscription OAuth tokens. Model:
-`models.py:AgentSecret`.
+Encrypted credentials for the agent's external services. Up to two rows:
+`name = 'chatgpt_oauth'`, the ChatGPT subscription OAuth tokens, and
+`name = 'finedge_api_key'`, the FinEdge Financials API key used by the research
+tools. Model: `models.py:AgentSecret`.
 
 ```sql
 CREATE TABLE agent_secret (
@@ -73,9 +74,12 @@ CREATE TABLE agent_secret (
 
 | Column | Type | Null | Key | Meaning |
 | --- | --- | --- | --- | --- |
-| `name` | VARCHAR | NO | PK | Secret name. Only `chatgpt_oauth` (`chatgpt_auth.SECRET_NAME`) is used. |
-| `value_enc` | TEXT | NO | | **Fernet encrypted** JSON. For `chatgpt_oauth` it is the LiteLLM ChatGPT auth record: `access_token`, `refresh_token`, `id_token`, `expires_at`, `account_id` (and any other keys LiteLLM's authenticator chooses to persist). |
-| `updated_at` | DATETIME | yes | | Naive UTC time of the last write (sign-in or token refresh). |
+| `name` | VARCHAR | NO | PK | Secret name: `chatgpt_oauth` (`chatgpt_auth.SECRET_NAME`) or `finedge_api_key` (`finedge.SECRET_NAME`). |
+| `value_enc` | TEXT | NO | | **Fernet encrypted**. For `chatgpt_oauth` it is JSON, the LiteLLM ChatGPT auth record: `access_token`, `refresh_token`, `id_token`, `expires_at`, `account_id` (and any other keys LiteLLM's authenticator chooses to persist). For `finedge_api_key` it is the raw API key string (8 to 256 characters, no whitespace, as validated by `FinEdgeKeyBody`), not JSON. |
+| `updated_at` | DATETIME | yes | | Naive UTC time of the last write (sign-in, token refresh, or FinEdge key save). |
+
+No default is declared for any column; every writer supplies all three
+values. The only index is the primary key.
 
 How it is wired: LiteLLM's `chatgpt/` provider normally keeps these tokens in
 a plain JSON file. `agent/chatgpt_auth.py:install` replaces the
@@ -83,7 +87,7 @@ authenticator's `_read_auth_file` and `_write_auth_file` with
 `read_tokens` and `write_tokens`, so every read and every refresh goes through
 this table, encrypted. Its token directory function is made a no-op.
 
-Code that touches it:
+Code that touches the `chatgpt_oauth` row:
 
 | Operation | File:function | Detail |
 | --- | --- | --- |
@@ -92,11 +96,29 @@ Code that touches it:
 | Read (derived) | `agent/chatgpt_auth.py:account_status` | Signed in when a `refresh_token` exists. Decodes the `id_token` claims for `email` and the plan (`https://api.openai.com/auth` claim, `chatgpt_plan_type`). Tokens are never returned to the API. |
 | Delete | `agent/chatgpt_auth.py:clear_tokens` | `POST /api/agent/chatgpt/logout`. |
 
-Lifecycle: created at first ChatGPT sign-in, rewritten on every token refresh
-or new sign-in, deleted on ChatGPT sign-out. `cancel_login` clears only the
-in-memory flow reference. An existing `_run_flow` worker writes tokens before
-checking whether its flow is still current, so a cancelled or superseded flow
-can recreate or overwrite this row after logout or a newer sign-in.
+Lifecycle of `chatgpt_oauth`: created at first ChatGPT sign-in, rewritten on
+every token refresh or new sign-in, deleted on ChatGPT sign-out. `cancel_login`
+clears only the in-memory flow reference. An existing `_run_flow` worker writes
+tokens before checking whether its flow is still current, so a cancelled or
+superseded flow can recreate or overwrite this row after logout or a newer
+sign-in.
+
+Code that touches the `finedge_api_key` row (all in `agent/finedge.py`, each in
+its own session):
+
+| Operation | File:function | Detail |
+| --- | --- | --- |
+| Upsert | `agent/finedge.py:write_key` | `PUT /api/agent/finedge` (`routers/agent.py:finedge_save`). Encrypts the key with `crypto.encrypt`, inserts the row or replaces `value_enc`, sets `updated_at`. |
+| Read | `agent/finedge.py:read_key` | Decrypts and returns the key, or `None` when the row is missing or does not decrypt. Used by `routers/agent.py:finedge_test` (`POST /api/agent/finedge/test`) and `_agent_for` (every chat turn and confirmation: a key adds the 14 research tools and the research prompt rules). |
+| Read (derived) | `agent/finedge.py:key_status` | `configured`, `masked_key` (8 asterisks plus the last 4 characters) and `updated_at` in IST. Used by `GET`, `PUT` and `DELETE /api/agent/finedge` and by `GET /api/agent/settings`. The key itself is never returned to the API. |
+| Delete | `agent/finedge.py:clear_key` | `DELETE /api/agent/finedge` (`routers/agent.py:finedge_remove`). No error when the row does not exist. |
+
+Lifecycle of `finedge_api_key`: created when the user first saves a FinEdge
+key on the Agent settings page, replaced on every later save, deleted when the
+user removes it. Saving or removing also clears the FinEdge in-process cache.
+The key is not checked against FinEdge when it is written. If `secret.key`
+changes, the row stays but no longer decrypts, so it reads as "not configured"
+until a new key is saved over it.
 
 ---
 

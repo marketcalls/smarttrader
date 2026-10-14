@@ -179,6 +179,8 @@ Processing on success:
 Other notes:
 
 - The uvicorn access log filter in `main.py` replaces `code=<value>` with `code=[redacted]`.
+  It matches literal query names only; encoded names such as `c%6fde` bypass the
+  current regex. It is not a general secret-redaction mechanism.
 - The saved redirect URL is not sent in the authorize or token-exchange request and is not compared
   against the callback URL. The broker uses its registered redirect configuration.
 - No OAuth `state` is generated or validated; the callback does not require a prior local login request.
@@ -265,6 +267,11 @@ Behaviour:
 | Anything else | `frontend/dist/index.html` (client-side routing) |
 
 The `dist` check runs per request, so a frontend build made after startup is picked up.
+
+Every file it returns (`index.html` and the hashed assets) carries `Cache-Control: no-cache`
+along with the `ETag` and `Last-Modified` that `FileResponse` sets. The browser revalidates on
+each load and gets a 304 when the file is unchanged, so a chunk patched in place under the same
+hashed name (see [../design/risks.md](../design/risks.md)) is picked up without a hard reload.
 
 Side effects: none.
 

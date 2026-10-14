@@ -81,8 +81,11 @@ def spa_fallback(full_path: str) -> FileResponse:
     index = dist / "index.html"
     if not index.is_file():
         raise HTTPException(status_code=404, detail="Frontend not built. Run npm run build in frontend/.")
+    # The built chunks can be patched in place under the same hashed name, so make
+    # the browser revalidate (ETag, cheap 304) instead of reusing a stale copy.
+    headers = {"Cache-Control": "no-cache"}
     if full_path:
         candidate = (dist / full_path).resolve()
         if candidate.is_relative_to(dist) and candidate.is_file():
-            return FileResponse(candidate)
-    return FileResponse(index)
+            return FileResponse(candidate, headers=headers)
+    return FileResponse(index, headers=headers)

@@ -12,6 +12,7 @@ document describes the controls in the code and the threats they do and do not c
 | TradeSmart API secret | `broker_config.api_secret_enc` (Fernet) | High: with the API key it signs the token exchange |
 | TradeSmart access token | `auth_session.access_token_enc` (Fernet), process memory while used | Critical: full trading access for the day |
 | ChatGPT OAuth tokens (access, refresh, id) | `agent_secret` row `chatgpt_oauth` (Fernet) | High: access to the user's ChatGPT subscription |
+| FinEdge API key | `agent_secret` row `finedge_api_key` (Fernet), process memory inside research tool closures for one run | Medium: use of the user's paid FinEdge data plan and its rate limits; no trading or account access |
 | Fernet key | `backend/data/secret.key` | Critical: decrypts all of the above |
 | Session cookie `st_session` | Browser cookie jar; only its SHA-256 is stored | High while active |
 | Account data (funds, positions, orders, holdings) | Fetched live; copies in agent transcripts and `agent.db` | Personal financial data |
@@ -32,7 +33,9 @@ document describes the controls in the code and the threats they do and do not c
   from ciphertext presence, so the user must explicitly re-enter the broker secret;
   the callback cannot repair it. There is no key rotation.
 - No `.env` files and no secrets in `config.py`. The only environment variables are
-  `SMARTTRADER_FRONTEND_URL` (not secret) and `CHATGPT_TOKEN_DIR` (a path).
+  `SMARTTRADER_FRONTEND_URL` (not secret) and `CHATGPT_TOKEN_DIR` (a path). The
+  FinEdge API key is not read from `.env` or the environment either; it is entered
+  only on the Agent settings page and stored encrypted (section 4.1).
 - `backend/.gitignore` excludes `data/`.
 
 Limitation: the key and the encrypted values sit in the same folder. Encryption at
@@ -63,7 +66,7 @@ local installation, not an authenticated broker account. Agent routes do not fil
 them by `user_id`. Signing in with a different broker account exposes the same local
 history and settings. This is a single-user design, not account isolation.
 
-## 4. Broker token handling
+## 4. Broker token and FinEdge key handling
 
 - The token is obtained server side from `GenAcsTok` using
   `checksum = sha256(api_key + api_secret + code)`; the secret never leaves the server.
@@ -78,6 +81,25 @@ history and settings. This is a single-user design, not account isolation.
   filter redacts literal `code=` parameters and httpx logging is turned down to
   WARNING. This is not a general secret scrubber: an encoded key such as `c%6fde`
   bypasses the regex, and upstream exception text is not centrally sanitized.
+
+### 4.1 FinEdge API key
+
+| Control | Implementation (`agent/finedge.py`, `routers/agent.py`) |
+| --- | --- |
+| Entry | Only through `PUT /api/agent/finedge` from the Agent settings page (password input, `autoComplete=off`). Body `{api_key}` must be 8 to 256 characters with no whitespace. Never in `.env`, environment variables, files or the repository. |
+| Storage | `crypto.encrypt()` into `agent_secret.value_enc`, row `finedge_api_key`, with `updated_at`. Same Fernet key and same limitation as the other secrets (section 2). |
+| Read back | Never. `GET /api/agent/finedge`, the `finedge` field of `GET /api/agent/settings` and the PUT and DELETE responses return only `configured`, `masked_key` (eight `*` plus the last 4 characters; eight `*` only when the key has 8 characters or fewer) and `updated_at`. The browser cannot recover the key; replacing it means pasting a new one. |
+| Use | `finedge.read_key()` decrypts it per request. `research.build_research_tools(key)` makes closures over it, so it is not in the system prompt, tool arguments, SSE frames, `agent_message` or `agent.db`. |
+| On the wire | HTTPS to `https://data.finedgeapi.com`. FinEdge accepts the key only as a `token` query parameter, so every request URL contains it. |
+| Logging | URLs are never logged: the `httpx` logger is at WARNING, and the code logs only "FinEdge API key saved" or "removed" and, for unexpected tool failures, the tool name and exception class. |
+| Error text | For a non-200 answer, the message is the status code plus at most 200 characters of FinEdge's text with the key replaced by `***`. A connection error becomes "FinEdge is unreachable (ExceptionClass)" with the httpx exception (which can contain the URL) dropped. These masked messages are the only FinEdge text that reaches the browser, the model or the transcript. |
+| Status codes | A rejected key is answered with 422, other FinEdge failures with 502, a missing key with 409. Never 401, because the SPA logs the user out on any 401. |
+| Removal | `DELETE /api/agent/finedge` deletes the row and clears the in-process FinEdge cache. The key is not revoked at FinEdge; the user does that in their FinEdge account if needed. |
+
+Residual exposure: anyone who can read `data/` can decrypt the key, as with the other
+secrets. Raising the `httpx` log level to INFO or DEBUG for troubleshooting would
+write the key into the console log. The masking relies on an exact string replace,
+so FinEdge echoing an encoded form of the key would not be masked (not observed).
 
 ## 5. CSRF, CORS and Origin checks
 
@@ -96,7 +118,9 @@ There is no CSRF token. Residual exposure:
   with their requests. Such a page can trigger body-less POSTs without a preflight:
   `/api/orders/{id}/cancel`, `/api/master-contract/download`, `/api/auth/logout`,
   `/api/agent/chatgpt/login`, `/api/agent/chatgpt/logout`, `/api/agent/test`,
-  `/api/agent/chat/{run_id}/cancel`. It cannot read responses. The most harmful is
+  `/api/agent/finedge/test`, `/api/agent/chat/{run_id}/cancel`. It cannot read
+  responses. `/api/agent/finedge/test` only spends two FinEdge calls; saving or
+  removing the FinEdge key needs a JSON body or a DELETE, which trigger a preflight. The most harmful is
   cancelling an open order, which needs a valid order id.
 - The two dev origins are allowed with credentials even in single-port production
   mode. Any process that serves a page on port 5173 of the same machine can read every
@@ -146,7 +170,10 @@ See [agent.md](agent.md) section 5 for the full list. Summary:
    Conversion, database or other unhandled failures need not produce a terminal
    audit row. `placed` records broker acceptance, not a confirmed fill.
 6. Prompt injection resistance: rule 1 of the system prompt, structured tool results,
-   approval UI shows the actual arguments, and a 20 tool call budget per run.
+   approval UI shows the actual arguments, and a tool call budget per run (20, or 40
+   when a FinEdge key is saved). FinEdge filing descriptions and company profiles
+   are third-party text and are treated as data under rule 1; research tools are read
+   only and cannot reach the broker.
 
 Chart orders (`/api/orders`) are a separate path with input validation and price
 protection but no risk limits; their safety step is the UI ticket click or
@@ -168,6 +195,16 @@ sign-out because `_run_flow()` writes them before checking flow identity. See R6
   treat agent conversations as shared with OpenAI under their ChatGPT plan terms.
 - OpenAI device-code OAuth endpoints for sign-in.
 - Cloudflare in front of TradeSmart sees a fixed desktop Chrome User-Agent.
+- FinEdge Financials API (`data.finedgeapi.com`, optional, only when a key is saved):
+  each research tool call sends the API key (as the `token` query parameter), the
+  company symbol or BSE code, statement and period choices, date ranges and, for
+  the key test, the fixed symbols ITC and TCS. FinEdge therefore learns which
+  companies the user researches and when, together with the server's public IP. No
+  broker credentials, account data, positions, orders or chat text are sent to
+  FinEdge.
+- FinEdge results flow on to OpenAI: research tool results are part of the agent
+  turn, so the fundamentals, quotes and filings returned by FinEdge are sent to the
+  ChatGPT backend as tool results, as above. The key itself is not.
 
 ## 9. Threat notes
 
@@ -184,4 +221,7 @@ sign-out because `_run_flow()` writes them before checking flow identity. See R6
 | Malicious or oversized symbol zip | Low | Medium | Fixed extract name, 512 MB member cap, HTTPS source | Acceptable |
 | Path traversal through SPA fallback | Low | Medium | `resolve()` plus `is_relative_to(dist)` | Acceptable |
 | Sensitive data in logs | Low | Low | Code redaction, httpx WARNING | User id is logged at login and logout |
+| FinEdge key leaked through a logged URL | Low | Medium (use of the paid plan) | httpx logger at WARNING, errors built from status and masked text, no URL in connection errors | Keep httpx at WARNING; FinEdge only supports the key as a query parameter |
+| FinEdge key read from the browser | Low | Medium | Never returned, only masked with the last 4 characters | Acceptable |
+| Misleading research output taken as advice | Medium | Medium to High (financial loss) | Prompt requires a rating with horizon, risks, data date and a not-advice disclaimer | Prompt-only; see [risks.md](risks.md) R10 |
 | Unencrypted transcripts | Medium | Medium | Local disk only | `agent_message` and `agent.db` hold account data in plain text |

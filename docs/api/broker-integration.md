@@ -1,18 +1,18 @@
-# Outbound integrations: TradeSmart Noren v2 (and ChatGPT)
+# Outbound integrations: TradeSmart Noren v2, ChatGPT and FinEdge
 
 Source: `backend/app/config.py`, `backend/app/broker/tradesmart.py`, `backend/app/broker/history.py`,
 `backend/app/broker/orders.py`, `backend/app/broker/order_service.py`, `backend/app/broker/stream.py`,
 `backend/app/broker/master_contract.py`, `backend/app/agent/tools.py`, `backend/app/agent/trading.py`,
-`backend/app/agent/chatgpt_auth.py`.
+`backend/app/agent/chatgpt_auth.py`, `backend/app/agent/finedge.py`, `backend/app/agent/research.py`.
 Tests: `test_checksum.py`, `test_callback.py`, `test_funds.py`, `test_history.py`, `test_orders.py`,
-`test_order_service.py`, `test_stream.py`, `test_master_contract.py`.
+`test_order_service.py`, `test_stream.py`, `test_master_contract.py`, `test_research.py`.
 
 Back to the [API index](README.md).
 
 This page lists every call the SmartTrader backend makes to external services. The browser never talks
-to TradeSmart directly, except for the OAuth login page it is redirected to.
+to TradeSmart directly, except for the OAuth login page it is redirected to, and never talks to FinEdge.
 
-Examples use placeholders (`<API_KEY>`, `<API_SECRET>`, `<ACCESS_TOKEN>`, `<USER_ID>`) and synthetic
+Examples use placeholders (`<API_KEY>`, `<API_SECRET>`, `<ACCESS_TOKEN>`, `<USER_ID>`, `<FINEDGE_API_KEY>`) and synthetic
 market/order data. Secrets and access tokens are encrypted in `backend/data/smarttrader.db`; the
 API key and broker user id are stored as ordinary text. Never copy real credentials or account data
 into documentation.
@@ -363,6 +363,130 @@ console login is replaced by an error asking the user to sign in from Agent sett
 blocks waiting for a console login. `litellm_patches.py` repairs tool-call arguments that the ChatGPT
 backend sends only in `done` events.
 
+## FinEdge Financials API (research tools)
+
+Module: `backend/app/agent/finedge.py` (key storage, HTTP client, cache) and
+`backend/app/agent/research.py` (the 14 agent research tools). Called by the research tools during
+`POST /api/agent/chat` and `/chat/confirm` (only when a key is saved) and by
+`POST /api/agent/finedge/test`. The routes that manage the key are in
+[agent.md](agent.md#finedge-api-key-fundamental-research).
+
+### Host, client and auth
+
+| Item | Value |
+| --- | --- |
+| Base URL | `https://data.finedgeapi.com` (`finedge.BASE_URL`) |
+| Auth | The API key in the `token` query parameter on every request. No header auth |
+| Client | One process-wide `httpx.Client` (`lru_cache`), header `Accept: application/json`, no custom User-Agent |
+| Timeout | 30 s (`TIMEOUT_SECONDS`) per attempt |
+| Retries | On HTTP 429, 500, 502, 503 and 504, up to two retries, sleeping 1 s and then 2 s (`RETRY_DELAYS`). Network errors and timeouts are not retried |
+| Method | GET only |
+
+```
+GET https://data.finedgeapi.com/api/v1/company-profile/ITC?token=<FINEDGE_API_KEY>
+Accept: application/json
+```
+
+Query parameters with a value of None or an empty string are dropped; `token` is always added last.
+A list value is sent as a repeated parameter (`symbol=ITC&symbol=RELIANCE`). Symbols in a URL path
+are trimmed, upper-cased and percent-encoded with no safe characters (`finedge.path_symbol`), so
+`M&M` becomes `M%26M`. Symbols are NSE symbols or BSE codes with no exchange suffix.
+
+### Responses and error handling
+
+| FinEdge answer | Result |
+| --- | --- |
+| 200 with JSON | Parsed JSON returned |
+| 200 with an empty body | `None` returned |
+| 200 with a body that is not JSON | `FinEdgeError(502, "FinEdge returned a response that is not JSON")` |
+| 401, plain text `ER006 - missing or invalid token` (wrong key) | `FinEdgeError(401, ...)` with `invalid_key` true (status 401 and `ER006` in the text) |
+| 401, plain text `ER002 - user not authorized to view this content` (company or data outside the plan) | `FinEdgeError(401, ...)` with `not_in_plan` true (401 or 403 that is not `ER006`) |
+| 403 | `not_in_plan` true |
+| 404 | `FinEdgeError(404, ...)`; the tools answer `Not found` |
+| 429 or 5xx after the retries, any other status | `FinEdgeError(<status>, <text>)` |
+| `httpx.HTTPError` (connect failure, timeout) | `FinEdgeError(0, "FinEdge is unreachable (<ExceptionClass>)")` |
+
+The error text is FinEdge's body with whitespace collapsed, cut to 200 characters, with any occurrence
+of the key replaced by `***` (the reason phrase when the body is empty). The exception text of an
+`httpx.HTTPError` is never used because it can contain the request URL, and so the key.
+
+Key masking: the key is never logged and never returned to the browser. `main.py` sets the `httpx`
+logger to WARNING, because httpx logs full request lines (including the `token` parameter) at INFO.
+API responses carry only `finedge.mask(key)`: 8 asterisks plus the last 4 characters.
+
+How the callers map these errors:
+
+| Caller | Mapping |
+| --- | --- |
+| `POST /api/agent/finedge/test` | `invalid_key` to 422; status 0 to 502 `FinEdge is unreachable. Try again in a minute.`; anything else to 502 `FinEdge error (<status>): <message>`. Never 401, because the frontend logs the user out on any 401 |
+| Research tools | Text for the model, never an exception: rejected key, `Not available` (outside the plan, with a note that the free Basic plan only covers ITC, RELIANCE and HDFCBANK), `Not found`, unreachable, or `Error from FinEdge (<status>): <message>` |
+
+### Key test
+
+`finedge.test_key` makes two calls. `/healthcheck` is not used because it answers 200 even for a wrong
+key.
+
+1. `GET /api/v1/company-profile/ITC`: ITC is in every plan, including the free Basic plan. Any error
+   here is raised (a wrong key gives 401 `ER006`). Its duration is reported as `latency_ms` and its
+   `name` as `sample_company`.
+2. `GET /api/v1/company-profile/TCS`: TCS is only in paid plans. Success gives `coverage: "all"`; a
+   `not_in_plan` refusal gives `coverage: "sample"`; any other error is raised.
+
+### Observed response details
+
+Verified against the live API:
+
+- `GET /api/v2/quote` returns an object keyed by symbol. The price is in `current_price` (not `price`;
+  the code reads `price` only as a fallback) and `change` is a percent string such as `"0.19%"`, which
+  the code parses to a number. Other fields used: `open_price`, `high_price`, `low_price`, `volume`,
+  `high52`, `low52`, `market_cap`, `tradetime`. Prices are delayed 15 to 30 minutes.
+- A batch quote fails entirely (401 `ER002`) if one symbol is outside the plan. The tools then quote
+  each symbol on its own (8 threads) and skip the refused ones.
+- Statement rows from `/api/v1/financials/{symbol}` have no `header`; they carry `year` and
+  `period_end` (an integer `YYYYMMDD`, for example `20260331`) and come newest first. The code sorts
+  them by `period_end` and `year` anyway and labels periods as `Mar 2026`.
+- Money values are absolute rupees; the tools divide by 1e7 to give Rs crore. Ratio values are
+  fractions; the tools multiply profitability ratios, growth rates and averages by 100.
+
+### Endpoints used by each tool
+
+All paths are under `https://data.finedgeapi.com` and also carry `token`. `{s}` is the path symbol.
+`statement_type` is `c` (consolidated) or `s` (standalone); with `consolidated=True` the tool tries
+`c` first and repeats with `s` when FinEdge returns no rows.
+
+| Tool | FinEdge calls |
+| --- | --- |
+| `search_companies` | `GET /api/v1/stock-symbols` (cached 24 h) |
+| `get_company_profile` | `GET /api/v1/company-profile/{s}`, `GET /api/v1/company-reports/{s}` (a failure of the second is ignored) |
+| `get_financial_statements` | `GET /api/v1/financials/{s}` with `statement_type`, `statement_code` (`pl`, `bs` or `cf`) and `period` |
+| `get_financial_ratios` | `GET /api/v1/ratios/{s}` with `statement_type` and `ratio_type` `pr`, `le`, `li` and `ef` (four calls per basis) |
+| `get_growth_metrics` | `GET /api/v1/financial-metrics/{s}` with `statement_type` and `ratio_type` `gr`, `av` and `cu` |
+| `get_stock_quotes` | `GET /api/v2/quote` with `symbol` repeated (up to 20 symbols; one by one on a plan refusal) |
+| `get_price_performance` | `GET /api/v1/daily-quotes/{s}` with `from` and `to` (calendar years), `GET /api/v1/index/price-returns` (cached 15 min, failure ignored) |
+| `get_valuation_history` | `GET /api/v1/annual-price-ratios/{s}` with `statement_type`, `GET /api/v1/daily-price-ratios/{s}` with `statement_type` and `from` (a year, not before 2018) |
+| `get_peers` | `GET /api/v1/peers/{s}` with `group` (`sub_industry`, `industry`, `sector` or `macro_sector`), then `GET /api/v2/quote` for the peers and the company in batches of 100 (an IT company can have more than 150 industry peers); BSE codes with an NSE symbol are quoted through the NSE symbol |
+| `compare_companies` | Per company, in parallel (up to 6 threads): `company-profile`, `financials` (pl, annual), `financial-metrics` (`gr`, `av`), `ratios` (`pr`, `le`), `annual-price-ratios`; then one `GET /api/v2/quote` for the covered companies |
+| `get_shareholding` | `GET /api/v1/shareholdings/pattern/{s}?period=quarterly`, `GET /api/v1/shareholdings/summary/{s}?period=quarterly` (failure ignored), and `GET /api/v1/shareholdings/ownership-current/{s}` when `top_holders` is above 0 |
+| `get_dividends_and_actions` | `GET /api/v1/dividend/{s}`, `GET /api/v1/corporate-actions/{action}/{s}` for `bonus`, `split` and `rights` (failures ignored), `GET /api/v2/quote` for the yield |
+| `get_announcements` | One of `GET /api/v1/corp-announcements`, `/api/v1/credit-ratings`, `/api/v1/investor-call-transcripts`, `/api/v1/investor-presentations` with `symbol`, `from_date` and `to_date` (ISO dates) |
+| `get_index_overview` | `GET /api/v1/index/market-price/daily-feed` and `GET /api/v1/index/price-returns` (both cached 15 min) |
+| Key test (`POST /api/agent/finedge/test`) | `GET /api/v1/company-profile/ITC`, then `GET /api/v1/company-profile/TCS` |
+
+### Process cache
+
+`finedge.cached(name, ttl, loader)` keeps large, slow-changing lists in a process-local dictionary
+guarded by a lock:
+
+| Cache name | FinEdge endpoint | TTL |
+| --- | --- | --- |
+| `stock-symbols` | `/api/v1/stock-symbols` | 24 h (`research.SYMBOLS_TTL`) |
+| `index-daily-feed` | `/api/v1/index/market-price/daily-feed` | 15 min (`research.INDEX_TTL`) |
+| `index-price-returns` | `/api/v1/index/price-returns` | 15 min |
+
+The cache is cleared (`finedge.clear_cache`) when a key is saved or removed, and lost on restart. A
+failed load is not cached. Two threads that miss at the same time both call FinEdge. Everything else
+is fetched afresh on each tool call.
+
 ## Calls made by the AI agent tools
 
 | Tool | Broker calls |
@@ -381,6 +505,9 @@ backend sends only in `done` events.
 | `modify_order` (after approval) | `OrderBook`, `ModifyOrder` |
 | `cancel_order` (after approval) | `CancelOrder` |
 
+The 14 research tools make no TradeSmart calls; their FinEdge calls are listed in
+[Endpoints used by each tool](#endpoints-used-by-each-tool).
+
 ## Notes and possible issues
 
 - `prc` and `trgprc` are formatted with `f"{value:g}"`, which keeps only 6 significant digits. Prices with
@@ -394,3 +521,6 @@ backend sends only in `done` events.
   `502 Could not reach TradeSmart`; agent tools return error text. For PlaceOrder, ModifyOrder and
   CancelOrder a timeout can follow broker acceptance, so it is not proof that nothing happened.
   Blindly retrying a placement can duplicate exposure.
+- FinEdge takes its key as a `token` query parameter, so the key is part of every request URL. It is
+  kept out of logs only because the `httpx` logger is set to WARNING and FinEdge errors are rebuilt
+  without the URL; any proxy or debug logging that records full URLs would capture it.

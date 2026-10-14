@@ -52,7 +52,8 @@ Never copy the key into documentation, logs or tickets.
 | --- | --- | --- | --- |
 | `broker_config.api_secret_enc` | TradeSmart API secret | `routers/auth.py:login` | `routers/auth.py:tradesmart_callback` |
 | `auth_session.access_token_enc` | TradeSmart bearer token | `routers/auth.py:tradesmart_callback` | funds, chart, orders, stream and agent routers |
-| `agent_secret.value_enc` | JSON with ChatGPT OAuth tokens | `agent/chatgpt_auth.py:write_tokens` | `agent/chatgpt_auth.py:read_tokens` |
+| `agent_secret.value_enc` (row `chatgpt_oauth`) | JSON with ChatGPT OAuth tokens | `agent/chatgpt_auth.py:write_tokens` | `agent/chatgpt_auth.py:read_tokens` |
+| `agent_secret.value_enc` (row `finedge_api_key`) | FinEdge Financials API key (plain string, not JSON) | `agent/finedge.py:write_key` | `agent/finedge.py:read_key` and `key_status` (deleted by `clear_key`) |
 
 `crypto.encrypt(text)` returns `Fernet.encrypt(text.encode('utf-8'))` as an
 ASCII string: a Fernet token (version byte `0x80`, 8-byte timestamp, 16-byte
@@ -70,7 +71,9 @@ configured" or "session expired":
 * missing access token: funds, chart and order routers deactivate the
   `auth_session` row and answer 401; the agent returns 401 without changing
   the row, and the tick socket closes with 4401 without changing it;
-* missing ChatGPT tokens: the agent reports "not signed in".
+* missing ChatGPT tokens: the agent reports "not signed in";
+* missing FinEdge key: `GET /api/agent/finedge` reports `configured: false`,
+  the key test answers 409, and chats run without the research tools.
 
 Only `InvalidToken` is caught. A malformed key file can make `get_fernet`
 raise during startup; decryption does not silently replace an invalid key.
@@ -182,7 +185,8 @@ Preserve both databases and their matching `secret.key` together.
 REST broker reads fetch funds, quotes, history, positions, holdings and order
 books afresh. Tick subscriptions retain the latest changed fields, and agent
 history can retain prior tool results on disk; those results are not a cache
-used to serve later broker reads. The
+used to serve later broker reads. FinEdge research data is fetched afresh on
+each tool call, except the three lists in the FinEdge cache below. The
 following process-local state exists and is lost on restart:
 
 | Object | Location | What it holds | Notes |
@@ -194,3 +198,5 @@ following process-local state exists and is lost on restart:
 | `_download_lock` | `broker/master_contract.py` | Whether a master contract download is running | Per process only. |
 | `TickState` | `broker/stream.py` | Last LTP and volume per WebSocket subscription | Touchline updates carry only changed fields, so the state is merged per message. |
 | `litellm.model_cost` | LiteLLM | Model catalogue used by `builder.available_models` | Comes with the installed LiteLLM version. |
+| `_cache`, `_cache_lock` | `agent/finedge.py` (`cached`) | FinEdge lists keyed by name, each with its load time (`time.monotonic`): `stock-symbols` (full symbol list for `search_companies`, TTL 24 h), `index-daily-feed` (all index levels and valuations for `get_index_overview`, TTL 15 min), `index-price-returns` (index returns for `get_index_overview` and the `get_price_performance` benchmark, TTL 15 min) | Cleared by `finedge.clear_cache` when the FinEdge key is saved or removed. A failed load is not stored. Not shared between worker processes. Holds market data only, never the key. |
+| `_client()` | `agent/finedge.py` (`lru_cache(maxsize=1)`) | The FinEdge `httpx.Client` (base URL, 30 s timeout) | Created on first FinEdge call; the key is not stored on it but sent per request. |

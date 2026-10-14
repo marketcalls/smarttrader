@@ -13,7 +13,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
-from app.agent import chatgpt_auth, trading
+from app.agent import chatgpt_auth, finedge, trading
 from app.agent.builder import (
     DEFAULT_MODEL,
     REASONING_EFFORTS,
@@ -21,6 +21,7 @@ from app.agent.builder import (
     available_models,
     build_agent,
 )
+from app.agent.research import RESEARCH_TOOL_DESCRIPTIONS, build_research_tools
 from app.agent.tools import TOOL_DESCRIPTIONS, build_tools
 from app.config import to_ist_iso, utcnow
 from app.crypto import decrypt
@@ -79,6 +80,8 @@ def get_settings(db: Session = Depends(get_db)) -> dict:
         "models": available_models(),
         "reasoning_efforts": list(REASONING_EFFORTS),
         "tools": [{"name": n, "description": d} for n, d in TOOL_DESCRIPTIONS],
+        "research_tools": [{"name": n, "description": d} for n, d in RESEARCH_TOOL_DESCRIPTIONS],
+        "finedge": finedge.key_status(),
         "order_tools": [
             {"name": "place_order", "description": "Place an order after your approval"},
             {"name": "modify_order", "description": "Modify an open order after your approval"},
@@ -101,6 +104,56 @@ def put_settings(body: SettingsBody, db: Session = Depends(get_db)) -> dict:
     row.updated_at = utcnow()
     db.commit()
     return _settings_dict(row)
+
+
+# ---------- FinEdge API key ----------
+# A rejected FinEdge key is answered with 422, never 401: the frontend treats any 401
+# as an expired SmartTrader session and signs the user out.
+
+
+class FinEdgeKeyBody(BaseModel):
+    api_key: str = Field(min_length=8, max_length=256, pattern=r"^\S+$")
+
+
+def _finedge_failure(exc: finedge.FinEdgeError) -> HTTPException:
+    if exc.invalid_key:
+        return HTTPException(status_code=422, detail="FinEdge rejected the API key. Check it and try again.")
+    if exc.status_code == 0:
+        return HTTPException(status_code=502, detail="FinEdge is unreachable. Try again in a minute.")
+    return HTTPException(status_code=502, detail=f"FinEdge error ({exc.status_code}): {exc.message}")
+
+
+@router.get("/finedge")
+def finedge_status() -> dict:
+    return finedge.key_status()
+
+
+@router.put("/finedge")
+def finedge_save(body: FinEdgeKeyBody) -> dict:
+    finedge.write_key(body.api_key)
+    finedge.clear_cache()
+    logger.info("FinEdge API key saved")
+    return finedge.key_status()
+
+
+@router.delete("/finedge")
+def finedge_remove() -> dict:
+    finedge.clear_key()
+    finedge.clear_cache()
+    logger.info("FinEdge API key removed")
+    return finedge.key_status()
+
+
+@router.post("/finedge/test")
+async def finedge_test() -> dict:
+    """Two small profile calls with the saved key: one any plan can read and one that needs a paid plan."""
+    key = finedge.read_key()
+    if not key:
+        raise HTTPException(status_code=409, detail="Save a FinEdge API key first.")
+    try:
+        return await run_in_threadpool(finedge.test_key, key)
+    except finedge.FinEdgeError as exc:
+        raise _finedge_failure(exc)
 
 
 # ---------- ChatGPT sign-in ----------
@@ -282,10 +335,14 @@ def _agent_for(conversation_id: str, access_token: str, user_id: str, *, include
     risk = trading.risk_settings()
     context: dict[str, Any] = {"conversation_id": conversation_id, "run_id": None}
     tools: list[Any] = list(build_tools(access_token, user_id))
+    finedge_key = finedge.read_key()
+    if finedge_key:
+        tools += build_research_tools(finedge_key)
     if risk["trading_enabled"] or include_orders:
         tools += trading.build_order_tools(access_token, user_id, context)
     agent = build_agent(model=model, reasoning_effort=effort, instructions=extra, tools=tools,
-                        session_id=conversation_id, user_id=user_id, trading=risk["trading_enabled"])
+                        session_id=conversation_id, user_id=user_id, trading=risk["trading_enabled"],
+                        research=bool(finedge_key))
     return agent, model, context
 
 

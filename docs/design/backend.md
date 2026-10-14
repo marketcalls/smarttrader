@@ -2,7 +2,8 @@
 
 The backend is a FastAPI application in `backend/app`, run by uvicorn as a single
 process. It talks to SQLite through SQLAlchemy 2, to TradeSmart through httpx (REST)
-and websockets (market data), and to the ChatGPT backend through Agno and LiteLLM.
+and websockets (market data), to the ChatGPT backend through Agno and LiteLLM, and,
+when a key is saved, to the FinEdge Financials API through httpx.
 
 ## 1. Package layout
 
@@ -21,7 +22,7 @@ backend/app/
     chart.py         /api/chart/intervals, /api/chart/history
     stream.py        WS /api/ws/ticks
     orders.py        /api/orders, /{id}/modify, /{id}/cancel, /close-position, /symbol
-    agent.py         /api/agent/* (settings, ChatGPT sign-in, conversations, SSE chat, risk, audit)
+    agent.py         /api/agent/* (settings, FinEdge key, ChatGPT sign-in, conversations, SSE chat, risk, audit)
   broker/
     tradesmart.py    REST client core, checksum, GenAcsTok, post_authenticated, funds
     history.py       candles via TPSeries and EODChartData, interval table, volume repair
@@ -30,8 +31,10 @@ backend/app/
     orders.py        PlaceOrder, ModifyOrder, CancelOrder, OrderBook lookup, price protection
     order_service.py chart trading: validation, LTP lookup, protected prices, symbol state
   agent/
-    builder.py       Agno Agent factory, system prompt, model list
+    builder.py       Agno Agent factory, system prompt, research rules, model list
     tools.py         ten read-only tools bound to the user's broker session
+    finedge.py       FinEdge API key (encrypted in agent_secret), HTTP client, key test, small cache
+    research.py      fourteen fundamental research tools bound to the FinEdge key
     trading.py       three confirmation-gated order tools, risk settings, audit trail
     chatgpt_auth.py  ChatGPT device-code sign-in and encrypted token storage for LiteLLM
     litellm_patches.py  repair for missing tool-call arguments in LiteLLM's stream bridge
@@ -43,7 +46,7 @@ backend/app/
 
 | Module | Responsibility | Notes |
 | --- | --- | --- |
-| `main.py` | Configures logging, creates `FastAPI(title="SmartTrader", version="0.1.0")`, installs `CORSMiddleware`, includes the seven routers, defines `GET /api/health` and the SPA fallback. | The fallback is registered last so every API route wins. |
+| `main.py` | Configures logging, creates `FastAPI(title="SmartTrader", version="0.1.0")`, installs `CORSMiddleware`, includes the seven routers, defines `GET /api/health` and the SPA fallback, which serves `frontend/dist` files with `Cache-Control: no-cache` so in-place patched chunks are revalidated. | The fallback is registered last so every API route wins. |
 | `config.py` | Constants (see [README.md](README.md) section 5), `ensure_data_dirs()`, `frontend_url()`, `utcnow()` (naive UTC for storage), `to_ist_iso()` and `now_ist_iso()` for output. | All timestamps are stored as naive UTC and rendered in IST. |
 | `db.py` | Creates the engine on `data/smarttrader.db` with `check_same_thread=False` and a 30 s timeout. A `connect` listener sets `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=30000`. `SessionLocal` uses `autoflush=False, expire_on_commit=False`. `init_db()` runs `create_all`, adds missing columns listed in `_ADDED_COLUMNS` (currently `agent_message.pending_json`), seeds `master_contract_status` row 1, and flips a stale `downloading` status to `error` ("Previous download was interrupted"). | There is no migration tool; `_ADDED_COLUMNS` is a minimal additive migration. |
 | `models.py` | Ten tables: `broker_config`, `auth_session`, `symtoken`, `master_contract_status`, `agent_setting`, `agent_secret`, `agent_conversation`, `agent_message`, `agent_risk`, `agent_order_audit`. | Single-row tables use `id=1`. |
@@ -60,7 +63,7 @@ backend/app/
 | `chart.py` | `GET /api/chart/intervals`, `GET /api/chart/history` | `require_session` | `history.fetch_history`, `SymToken` lookup |
 | `stream.py` | `WS /api/ws/ticks` | Origin check, then cookie session | `broker.stream.relay_ticks`, threadpool DB lookups |
 | `orders.py` | `GET /api/orders/symbol`, `POST /api/orders`, `POST /api/orders/{id}/modify`, `POST /api/orders/{id}/cancel`, `POST /api/orders/close-position` | `require_session` | `order_service` |
-| `agent.py` | `/api/agent/status`, `/settings` (GET, PUT), `/chatgpt/login` (POST, GET, DELETE), `/chatgpt/logout`, `/test`, `/conversations` (list, get, patch, delete), `/chat` (SSE), `/chat/confirm` (SSE), `/chat/{run_id}/cancel`, `/risk` (GET, PUT), `/orders/audit` | router-level `require_session` | `agent.builder`, `agent.tools`, `agent.trading`, `agent.chatgpt_auth` |
+| `agent.py` | `/api/agent/status`, `/settings` (GET, PUT), `/finedge` (GET, PUT, DELETE), `/finedge/test` (POST), `/chatgpt/login` (POST, GET, DELETE), `/chatgpt/logout`, `/test`, `/conversations` (list, get, patch, delete), `/chat` (SSE), `/chat/confirm` (SSE), `/chat/{run_id}/cancel`, `/risk` (GET, PUT), `/orders/audit` | router-level `require_session` | `agent.builder`, `agent.tools`, `agent.research`, `agent.finedge`, `agent.trading`, `agent.chatgpt_auth` |
 
 Endpoint contracts are documented in `docs/api`.
 
@@ -83,6 +86,16 @@ ten read tools; `trading.py` provides three `requires_confirmation` order tools 
 second risk check and an audit table; `chatgpt_auth.py` drives the device-code login
 and stores tokens encrypted; `litellm_patches.py` fixes a LiteLLM stream bug that
 drops tool-call arguments.
+
+| Module | Responsibility |
+| --- | --- |
+| `finedge.py` | The FinEdge API key and HTTP client. `read_key()`, `write_key()`, `clear_key()` on the `agent_secret` row `finedge_api_key` (Fernet). `mask()` and `key_status()` (`configured`, `masked_key` with the last 4 characters, `updated_at` in IST; never the key). `get(path, api_key, params)` uses one cached `httpx.Client` (base `https://data.finedgeapi.com`, 30 s), adds the key as the `token` query parameter, retries 429 and 5xx twice (1 s, 2 s) and raises `FinEdgeError(status_code, message)` with the key replaced by `***` and no URL. `path_symbol()` URL-encodes symbols such as `M&M`. `test_key()` probes company-profile `ITC` then `TCS` and reports coverage `all` or `sample`. `cached()` and `clear_cache()`: a process-memory TTL cache under a lock. |
+| `research.py` | `build_research_tools(api_key)` returns 14 guarded closures (search, profile, statements, ratios, growth, quotes, price performance, valuation history, peers, comparison, shareholding, dividends and actions, announcements, index overview) that trim FinEdge payloads and convert units to Rs crore and percent. `compare_companies` fetches up to 6 companies in parallel threads; batch quotes fall back to one by one with 8 threads when FinEdge refuses a batch. `RESEARCH_TOOL_DESCRIPTIONS` holds the labels for the settings page. |
+| `builder.py` (research) | `RESEARCH_RULES` or `RESEARCH_OFF_RULE` is added to the instructions from the `research` flag, and `tool_call_limit` is 40 with research on, 20 otherwise. |
+
+`routers/agent.py` `_agent_for()` reads the key on each chat or confirm request and
+appends the research tools when one is saved. See [agent.md](agent.md) sections 3.1,
+4.2 and 4.4.
 
 ## 3. Dependency injection (`deps.py`)
 
@@ -147,7 +160,8 @@ sequenceDiagram
 | ChatGPT device-code poll | `threading.Thread(name="chatgpt-login", daemon=True)` | `POST /api/agent/chatgpt/login` | Module-level `_flow` object under a lock; the identity check discards stale status updates only. Token writes occur before that check, so cancelled or superseded flows can still save tokens. |
 | Tick relay | three asyncio tasks per browser WebSocket (browser reader, broker reader, heartbeat) | `WS /api/ws/ticks` | `asyncio.wait(FIRST_COMPLETED)`, then cancel and gather the rest. |
 | Agent run | Agno `arun` or `acontinue_run` async generator consumed by a `StreamingResponse` | `POST /api/agent/chat`, `POST /api/agent/chat/confirm` | Process-local `_running` dict maps run id to the agent for `/chat/{run_id}/cancel`. Client disconnect is checked between events and cancels the run. |
-| Agent tool calls | Agno runs sync tool functions with `asyncio.to_thread` | Model tool calls | Each tool opens its own DB session; broker calls are blocking httpx calls in that thread. |
+| Agent tool calls | Agno runs sync tool functions with `asyncio.to_thread` | Model tool calls | Each tool opens its own DB session; broker calls are blocking httpx calls in that thread. Research tools may start their own short-lived `ThreadPoolExecutor` (up to 6 workers for `compare_companies`, 8 for one-by-one quotes). |
+| FinEdge key test | `run_in_threadpool(finedge.test_key, key)` | `POST /api/agent/finedge/test` | Two sequential GETs; no lock. |
 
 There is no scheduler, task queue or periodic job. Funds, order state and master
 contract status are refreshed by frontend polling.
@@ -169,9 +183,12 @@ contract status are refreshed by frontend polling.
   in progress; `busy_timeout=30000` absorbs writer contention.
 - Each broker REST call creates a new `httpx.Client` (no shared connection pool),
   except `fetch_funds`, which reuses one client for its two calls, and the master
-  download, which uses one client for all six files.
+  download, which uses one client for all six files. FinEdge calls share one
+  process-wide `httpx.Client` (`lru_cache`).
+- The FinEdge cache (`finedge._cache`) is guarded by a `threading.Lock`; two threads
+  missing at the same moment may both load the list, which is harmless.
 - All process-level state (`_download_lock`, `_running`, ChatGPT `_flow`, cached
-  `Fernet`, LiteLLM monkey patches) is per process. Running more than one uvicorn
+  `Fernet`, LiteLLM monkey patches, FinEdge client and cache) is per process. Running more than one uvicorn
   worker would break 409 detection, run cancellation and the sign-in flow. The design
   requires `--workers 1` (the default).
 
@@ -192,6 +209,10 @@ Exception mapping used by routers:
 | Master download already running | lock held | 409 |
 | Agent not signed in to ChatGPT | `account_status()` | 409 "Sign in with ChatGPT in Agent settings first." |
 | Agent approval not pending | state check | 409 |
+| FinEdge key test with no saved key | `read_key()` is None | 409 "Save a FinEdge API key first." |
+| FinEdge key body invalid (under 8 or over 256 characters, or whitespace) | Pydantic | 422 |
+| FinEdge rejected the key (401 `ER006`) | `FinEdgeError.invalid_key` | 422 "FinEdge rejected the API key. Check it and try again." (never 401, because the SPA logs out on any 401) |
+| FinEdge unreachable or other FinEdge error | `FinEdgeError` | 502 "FinEdge is unreachable. Try again in a minute." or "FinEdge error (status): text" with the key masked |
 | Provider failures in chat | any exception or `RunError` | SSE `error` frame with a friendly message from `_provider_message()`, then `done` with reason `error` |
 
 The OAuth callback never returns an error body; every failure becomes a 302 to
@@ -205,7 +226,9 @@ that status frame.
 
 Agent read tools never raise to Agno: a `guarded` wrapper turns
 `SessionExpiredError`, `BrokerError` and any other exception into a string beginning
-with "Error" that the model sees as the tool result. Order tools return "Refused by
+with "Error" that the model sees as the tool result. Research tools have their own
+`guarded` wrapper that maps `FinEdgeError` to "Error ...", "Not available ..." (not in
+plan) or "Not found ..." strings. Order tools return "Refused by
 the risk check ..." or "Order not placed ..." strings and write an audit row.
 
 Note: a broker session expiry seen inside an agent tool does not deactivate the
@@ -215,7 +238,8 @@ Note: a broker session expiry seen inside an agent tool does not deactivate the
 
 - `logging.basicConfig(level=INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")`.
 - `httpx` is lowered to WARNING so request lines (which may include query strings) are
-  not logged.
+  not logged. This matters for FinEdge, whose key travels in the `token` query
+  parameter: raising the httpx level to INFO or DEBUG would log the key.
 - `_RedactAuthCode` on `uvicorn.access` replaces literal `code=<value>` with
   `code=[redacted]`. Encoded parameter names such as `c%6fde` are not recognized;
   this filter is not a guarantee that all forms of authorization code are hidden.
@@ -223,7 +247,8 @@ Note: a broker session expiry seen inside an agent tool does not deactivate the
   or tokens. `generate_access_token` logs only the HTTP status and broker `emsg`.
 - Logged identifiers: the broker user id on login and logout, order ids and order
   summaries for chart orders, agent trading enable or disable, ChatGPT sign-in
-  outcome. Application log statements avoid deliberately including tokens and
+  outcome, "FinEdge API key saved" and "FinEdge API key removed" (no key), and a
+  research tool failure with only the tool name and exception class. Application log statements avoid deliberately including tokens and
   cookies, but there is no central sanitizer for arbitrary upstream error text.
 - Unexpected errors use `logger.exception` (stack trace) in the callback, master
   download and LiteLLM patch paths.
@@ -232,14 +257,20 @@ Note: a broker session expiry seen inside an agent tool does not deactivate the
 
 ## 9. Testing
 
-`backend/tests` holds 64 pytest functions across nine files (69 cases after
-parametrization, all passing in the 2026-10-14 offline documentation audit): checksum and authorize
+`backend/tests` holds 86 pytest functions across ten files (94 cases after
+parametrization, all passing on 2026-10-14): checksum and authorize
 URL, OAuth callback redirects and cookie, funds computation and broker error paths,
 history parsing and routes, master contract parsers, order mapping and price
 protection, chart order service, tick stream relay and Origin check, and agent
 (encrypted token storage, authenticator never blocks, indicator math, settings,
 SSE frames, LiteLLM argument recovery, confirmation gating, risk refusal, pause and
-resume). Broker traffic is mocked with httpx transports and fakes. There are no
+resume), and FinEdge research in `test_research.py` (key encrypted and never
+returned, invalid key bodies, test route mapping and plan coverage, research tools
+attached only with a key, token sent and masked in errors, unreachable error without
+the key, unit conversion, standalone fallback, readable tool errors, one-by-one quote
+fallback, peers, comparison, announcements, search and profile trimming). Broker and
+FinEdge traffic is mocked with httpx transports and fakes; no test calls the live
+FinEdge API. There are no
 frontend tests in the repository. The Gherkin files are documentation, with no BDD
 runner configured. The [BDD traceability map](../bdd/README.md) distinguishes direct,
 partial and missing coverage; passing service tests does not establish UI or live
@@ -249,7 +280,7 @@ broker behavior.
 
 | Topic | SPEC.md | Code |
 | --- | --- | --- |
-| Layout | Lists `tradesmart.py`, `master_contract.py` under broker and `builder.py`, `tools.py`, `chatgpt_auth.py` under agent | Also has `broker/history.py`, `broker/stream.py`, `broker/orders.py`, `broker/order_service.py`, `agent/trading.py`, `agent/litellm_patches.py` |
+| Layout | Lists `tradesmart.py`, `master_contract.py` under broker and `builder.py`, `tools.py`, `chatgpt_auth.py` under agent | Also has `broker/history.py`, `broker/stream.py`, `broker/orders.py`, `broker/order_service.py`, `agent/trading.py`, `agent/litellm_patches.py`, `agent/finedge.py`, `agent/research.py` |
 | Open order statuses | `OPEN`, `TRIGGER_PENDING` | `OPEN`, `TRIGGER_PENDING`, `PENDING` |
 | WS foreign Origin | "refused with 403" | Closed with code 4403 before accept, which the browser observes as HTTP 403 |
 | Run command | Original setup used `uv run uvicorn ...` | This checkout needs `uv run python -m uvicorn ...`; the root README now uses that form |

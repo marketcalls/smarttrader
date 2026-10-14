@@ -42,6 +42,19 @@ TRADING_RULE = (
     "orders with market price protection because TradeSmart refuses market orders from the API."
 )
 
+RESEARCH_RULES = """Fundamental research (FinEdge tools):
+- Use the FinEdge tools (search_companies, get_company_profile, get_financial_statements, get_financial_ratios, get_growth_metrics, get_valuation_history, get_peers, compare_companies, get_shareholding, get_dividends_and_actions, get_announcements, get_index_overview, get_stock_quotes, get_price_performance) for fundamentals and long price history. FinEdge symbols are NSE symbols or BSE codes with no exchange, for example ITC or 500875; call search_companies when the user gives a company name. Use the TradeSmart tools for live prices and intraday technicals.
+- Fetch before you write. Quote every figure from a tool result, with its unit (Rs crore, percent, times) and period (financial years end in March), and state whether figures are consolidated or standalone. Do not mix the two when comparing companies. If a tool fails or the FinEdge plan does not cover a company, say which data is missing and carry on with the rest.
+- Research report on a company: summary, business, financial performance over 5 years, profitability and returns, balance sheet and cash flow, valuation against its own history and its peers, shareholding, dividends, recent filings, key risks, conclusion.
+- Comparison: call compare_companies, show one table with a row per metric and a column per company, then explain who leads on growth, profitability, balance sheet strength and valuation.
+- Buy or sell recommendation: give one only when the user asks. If no horizon is given, ask whether they mean medium term (6 to 18 months) or long term (3 years or more). Medium term weighs recent quarterly earnings momentum, price trend against the 50 and 200 day averages, valuation percentile and near-term catalysts in filings. Long term weighs 5 year growth, return on equity and capital, cash conversion, debt, dividend record and valuation against history. Structure it as: rating (Buy, Accumulate, Hold, Reduce or Sell) with the horizon, thesis, supporting numbers, valuation view with the method used, risks, what would change the view, and the data date. Never promise a return. End with: This is a research view for education, not investment advice. Consult a SEBI registered investment adviser before investing."""
+
+RESEARCH_OFF_RULE = (
+    "Fundamental research tools are switched off because no FinEdge API key is saved. If the user asks for "
+    "fundamentals, a research report, a company comparison or a buy or sell recommendation, say that they can "
+    "add a FinEdge API key in Agent settings to enable it."
+)
+
 
 @lru_cache(maxsize=1)
 def agent_db() -> SqliteDb:
@@ -63,6 +76,7 @@ def build_agent(
     session_id: str,
     user_id: str | None = None,
     trading: bool = False,
+    research: bool = False,
 ) -> Agent:
     chatgpt_auth.install()
     litellm_patches.install()
@@ -75,7 +89,8 @@ def build_agent(
         top_p=None,
         request_params=request_params,
     )
-    prompt = [SYSTEM_PROMPT.format(trading_rule=TRADING_RULE if trading else READ_ONLY_RULE)]
+    prompt = [SYSTEM_PROMPT.format(trading_rule=TRADING_RULE if trading else READ_ONLY_RULE),
+              RESEARCH_RULES if research else RESEARCH_OFF_RULE]
     if instructions and instructions.strip():
         prompt.append("Additional instructions from the user's settings:\n" + instructions.strip())
     return Agent(
@@ -90,7 +105,8 @@ def build_agent(
         num_history_runs=8,
         add_datetime_to_context=True,
         timezone_identifier="Asia/Kolkata",
-        tool_call_limit=20,
+        # A full research report or a comparison takes many more tool calls than a quote.
+        tool_call_limit=40 if research else 20,
         markdown=True,
         telemetry=False,
     )

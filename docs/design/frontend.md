@@ -14,6 +14,12 @@ Component and function names inside the bundle are minified, so names used below
 describe roles, not original identifiers. Anything not visible in the bundle is
 marked as inferred.
 
+One chunk is no longer the original build output: `assets/AgentConfigPage-C4TKen9_.js`
+was hand patched in place (2026-10-14) to add the FinEdge API key card and the
+research tools list (section 5.6.1). There is no source for this change. The
+original chunk can be restored from git (`git checkout -- frontend/dist/assets/AgentConfigPage-C4TKen9_.js`
+reverts the patch).
+
 ## 1. Build output
 
 | File | Size | Content |
@@ -23,7 +29,7 @@ marked as inferred.
 | `assets/index-DgGJuggg.css` | 52 KB | Tailwind 4 output with theme tokens |
 | `assets/TradingPage-D_x_c_oF.js` | 827 KB | Lazy chunk: chart page with the openalgo-charts engine, indicators, drawing tools, order ticket, tick socket |
 | `assets/AgentPage-MHF7gvG9.js` | 179 KB | Lazy chunk: chat page with react-markdown and remark-gfm |
-| `assets/AgentConfigPage-C4TKen9_.js` | 17 KB | Lazy chunk: agent settings page |
+| `assets/AgentConfigPage-C4TKen9_.js` | 20 KB (17 KB before the patch) | Lazy chunk: agent settings page. Hand patched to add the FinEdge API key card; the file name (content hash) was kept, so `index-*.js` still loads it. |
 | `assets/agent-BopMnDiO.js` | 2 KB | Shared agent API client, query keys and SSE reader (used by both agent pages) |
 
 `vite.config.ts` raises `chunkSizeWarningLimit` to 900 KB for the chart chunk.
@@ -71,15 +77,18 @@ Query keys:
 | symbol order state (key built from symbol and exchange) | `GET /api/orders/symbol` | Every 3 s, only for tradable (non `_INDEX`) exchanges |
 | `["agent","status"]`, `["agent","settings"]`, `["agent","risk"]`, `["agent","audit"]` | agent settings endpoints | |
 | `["agent","login"]` | `GET /api/agent/chatgpt/login` | Every 3 s while a sign-in flow is active |
+| `["agent","finedge"]` | `GET /api/agent/finedge` | Invalidated (with `["agent","settings"]`) after save and remove |
 | `["agent","conversations"]`, `["agent","conversation", id]` | conversation endpoints | |
 
 Mutations: login, logout, master download, place, modify, cancel, close position,
 save settings, save risk, ChatGPT login start, cancel and logout, model test, rename
-and delete conversation, cancel run.
+and delete conversation, cancel run, FinEdge key save (`PUT /api/agent/finedge`),
+test (`POST /api/agent/finedge/test`) and remove (`DELETE /api/agent/finedge`).
 
 ### 3.2 API client
 
-A small `fetch` wrapper (main chunk):
+A small `fetch` wrapper (main chunk, exported from `index-*.js`; the patched
+settings chunk imports it as `Qe` for the FinEdge calls):
 
 - Sends `Accept: application/json`, adds `Content-Type: application/json` when there is
   a body, always `credentials: "include"`, supports `AbortSignal`.
@@ -201,10 +210,39 @@ full-height variant of the header.
   code to enter, polling until signed in, sign out.
 - Model select (models available through LiteLLM), reasoning effort (Model default,
   low, medium, high), extra instructions textarea, Save, Test.
-- Tools list (read tools and order tools with descriptions).
+- Tools list: read tools, then research tools, then order tools, each with its
+  description. The card text says the agent calls tools "through your TradeSmart
+  session and, for fundamentals, your FinEdge key". Research tools (from
+  `research_tools` in `GET /api/agent/settings`) are dimmed with "(needs a FinEdge
+  key)" until `finedge.configured` is true; order tools are dimmed while trading is
+  off.
+- FinEdge API key card (see 5.6.1), rendered after the ChatGPT, Model and Tools cards
+  and before the trading settings.
 - Trading: "Allow the agent to place, modify and cancel orders" toggle, max order value
   (INR), max quantity per order, max agent orders per day, allowed exchanges.
 - Order audit table: newest first, last 100 rows.
+
+#### 5.6.1 FinEdge API key card (hand patch of the build)
+
+| Element | Behaviour |
+| --- | --- |
+| Title and text | "FinEdge API key". "Fundamental data for research reports, company comparisons and buy or sell views. The key is stored encrypted in the SmartTrader database and is never shown again." |
+| Badge | "Key saved" (profit style) when `configured`, otherwise "Not set"; a skeleton while loading |
+| Input | Password field, `autoComplete=off`, no spell check. Label "API key", or "Replace API key" when one is saved. Placeholder "Paste your FinEdge API key", or "Saved key " followed by the `masked_key` (eight `*` and the last 4 characters). Hint: "Get a key at finedgeapi.com. The free Basic plan only covers ITC, RELIANCE and HDFCBANK.", or "Saved <local time>. Paste a new key to replace it." |
+| Save key | Submit; disabled while the field is empty. Sends `PUT /api/agent/finedge {api_key}` with the trimmed value, then clears the field, invalidates `["agent","finedge"]` and `["agent","settings"]` (so the Tools card updates) and runs the test automatically. |
+| Test key | `POST /api/agent/finedge/test`; disabled until a key is saved. Success with coverage `all`: "Key works and covers all companies. FinEdge answered in N s." Coverage `sample`: "Key works, but this plan only covers the sample companies ITC, RELIANCE and HDFCBANK." Failure: "Test failed" alert with the server message. |
+| Remove key | Shown only when a key is saved. `DELETE /api/agent/finedge`, resets the test result and invalidates the queries. |
+| Errors | Load failure: "Could not load the FinEdge key status". Save failure: the server message (for example a 422 for a too short key). The backend never returns 401 for FinEdge problems, so these errors do not trigger the global logout. |
+
+The key is never in browser storage or query cache; the page only ever holds
+`configured`, `masked_key` and `updated_at`, plus what the user is typing.
+
+This card exists only in the minified chunk. Because `frontend/src` is missing, the
+change was written directly into `AgentConfigPage-C4TKen9_.js`. If the frontend is
+ever rebuilt from recovered source, the card and the research tools rows disappear
+unless they are re-implemented in source. Because the file name was not changed, a
+browser that cached the old chunk shows the page without the card until a hard
+reload. See [risks.md](risks.md) R1 and R11.
 
 ## 6. Spec discrepancies (frontend)
 
@@ -213,4 +251,5 @@ full-height variant of the header.
 | Routes | Frontend section lists `/`, `/login`, `/dashboard` | Also `/trading`, `/agent`, `/agent/config` (the agent section of the spec mentions the agent routes; the chart route path is not named in the spec) |
 | Chart history `days` | API supports `days` | The client never sends `days`; the backend default lookback is always used |
 | Symbol search | "small symbol search box" | Adds an exchange filter and opens the chart on selection |
-| Source tree | Implied present | Missing; only the compiled bundle exists, so the frontend cannot be modified or rebuilt |
+| Source tree | Implied present | Missing; only the compiled bundle exists, so the frontend cannot be rebuilt. The settings chunk was modified by a hand patch of the minified file (FinEdge card), not from source. |
+| FinEdge key card | Not in the spec | Hand-patched card on `/agent/config` (section 5.6.1) |

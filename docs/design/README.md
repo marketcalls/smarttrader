@@ -9,10 +9,10 @@ section of each file and the summary in [risks.md](risks.md)).
 | --- | --- |
 | [README.md](README.md) | Architecture overview, component diagram, tech stack, process and port model, configuration |
 | [backend.md](backend.md) | Module responsibilities, dependency injection, lifecycle, background work, concurrency, errors and logging |
-| [flows.md](flows.md) | Sequence diagrams for login, master contract, funds, charts, live ticks, orders and the agent chat turn |
-| [agent.md](agent.md) | The AI agent: model and provider, tools, guardrails, persistence |
+| [flows.md](flows.md) | Sequence diagrams for login, master contract, funds, charts, live ticks, orders, the agent chat turn, a research report turn and saving the FinEdge key |
+| [agent.md](agent.md) | The AI agent: model and provider, prompt rules, read, research and order tools, guardrails, persistence |
 | [frontend.md](frontend.md) | Pages, routing, state, theming and components (reconstructed from the build) |
-| [security.md](security.md) | Secrets, encryption, session cookie, CSRF and CORS, broker token handling, agent order safety, threat notes |
+| [security.md](security.md) | Secrets, encryption, session cookie, CSRF and CORS, broker token and FinEdge key handling, agent order safety, third-party data flows, threat notes |
 | [risks.md](risks.md) | Known gaps, technical debt and recommendations |
 
 ## 1. What the system is
@@ -31,6 +31,9 @@ Online (Noren v2 API). One person runs it on their own machine at
 - An AI agent (Agno plus LiteLLM, using a ChatGPT subscription) that reads account
   and market data through tools and, when explicitly enabled, can propose orders
   that the user must approve in the UI before anything is sent.
+- Fundamental research in the agent (company reports, comparisons, buy or sell views
+  with a medium or long term horizon) through the FinEdge Financials API, enabled
+  when the user saves a FinEdge API key on the Agent settings page.
 
 ## 2. Component diagram
 
@@ -63,6 +66,8 @@ flowchart LR
             BLD["builder.py<br/>Agno Agent, prompt"]
             TOOLS["tools.py<br/>10 read tools"]
             TRD["trading.py<br/>3 order tools, risk, audit"]
+            RES["research.py<br/>14 research tools"]
+            FED["finedge.py<br/>FinEdge key, HTTP client"]
             CGA["chatgpt_auth.py<br/>device flow, token store"]
             LLP["litellm_patches.py<br/>stream bridge fix"]
         end
@@ -78,6 +83,7 @@ flowchart LR
     NOREN["TradeSmart Noren v2<br/>REST, OAuth, WebSocket,<br/>symbol zip files"]
     LLM["ChatGPT backend<br/>(OpenAI, via LiteLLM chatgpt/)"]
     OAI["OpenAI device-code OAuth"]
+    FIN["FinEdge Financials API<br/>data.finedgeapi.com<br/>(key as token query parameter)"]
 
     SPA -- "HTTP JSON, cookie st_session" --> MAIN
     SPA -- "WebSocket" --> RSTREAM
@@ -95,6 +101,9 @@ flowchart LR
     BLD --> TRD
     BLD --> CGA
     BLD --> LLP
+    RAGENT --> RES
+    RAGENT -- "key status, save, test" --> FED
+    RES --> FED
     TOOLS --> TS
     TOOLS --> HIST
     TRD --> ORD
@@ -109,15 +118,21 @@ flowchart LR
     ORD --> NOREN
     BLD --> LLM
     CGA --> OAI
+    FED --> FIN
+    FED -- "encrypted key in agent_secret" --> CORE
 ```
 
 Key properties:
 
 - One process holds all state that matters: the SQLite files, the in-memory agent run
-  registry, the master contract download lock and the ChatGPT sign-in flow. The
+  registry, the master contract download lock, the ChatGPT sign-in flow and the
+  FinEdge response cache. The
   design assumes exactly one uvicorn worker.
-- The browser never receives the TradeSmart API secret, the broker access token or
-  the ChatGPT OAuth tokens. All broker and LLM calls are made server side.
+- The browser never receives the TradeSmart API secret, the broker access token,
+  the ChatGPT OAuth tokens or the FinEdge API key (only a masked form with the last
+  4 characters). All broker, LLM and FinEdge calls are made server side.
+- FinEdge is an optional third external system: without a saved key the research
+  tools are not attached and the agent works as before.
 - The broker WebSocket is opened by the backend per browser tick socket and only
   price and volume are forwarded.
 
@@ -135,14 +150,14 @@ Backend (`backend/pyproject.toml`, resolved versions from `backend/uv.lock`):
 | Pydantic | (transitive) | 2.14.0 | Request validation |
 | SQLAlchemy | `>=2,<3` | 2.1.4 | ORM and engine for SQLite |
 | greenlet | `>=3.5.6` | 3.5.6 | SQLAlchemy dependency |
-| httpx | `>=0.28.1` | 0.28.1 | Sync REST client to TradeSmart |
+| httpx | `>=0.28.1` | 0.28.1 | Sync REST client to TradeSmart and FinEdge |
 | websockets | `>=17.2` | 17.2 | Client socket to the Noren WebSocket |
 | cryptography | `>=50.0.2` | 50.0.2 | Fernet encryption at rest |
 | agno | `>=3.1.2` | 3.1.2 | Agent framework (runs, tools, pause and resume, SQLite session store) |
 | litellm | `>=1.104.2` | 1.104.2 | Model access through the `chatgpt/` provider |
 | openai | (transitive) | 2.54.0 | Used by LiteLLM |
 | tzdata | `>=2026.5` | 2026.5 | Time zone data (Asia/Kolkata) on Windows |
-| pytest (dev) | `>=9.1.1` | 9.1.1 | Tests (64 test functions in `backend/tests`) |
+| pytest (dev) | `>=9.1.1` | 9.1.1 | Tests (86 test functions in `backend/tests`) |
 
 Frontend (`frontend/package.json`, resolved versions from `frontend/package-lock.json`):
 
@@ -227,7 +242,9 @@ flowchart LR
 ## 5. Configuration
 
 There is no settings file and no `.env`. `backend/app/config.py` holds paths and
-constants; secrets live in SQLite (encrypted) and in `data/secret.key`.
+constants; secrets live in SQLite (encrypted) and in `data/secret.key`. This includes
+the FinEdge API key: it is entered on the Agent settings page and stored encrypted
+in `agent_secret`; it is never read from `.env` or an environment variable.
 
 | Name | Value | Purpose |
 | --- | --- | --- |
@@ -254,7 +271,12 @@ constants; secrets live in SQLite (encrypted) and in `data/secret.key`.
 Other configuration points in code:
 
 - `agent/builder.py`: `AGENT_DB_PATH = data/agent.db`, `DEFAULT_MODEL = "gpt-5.5"`,
-  reasoning efforts `low`, `medium`, `high`, history of 8 runs, 20 tool calls per turn.
+  reasoning efforts `low`, `medium`, `high`, history of 8 runs, 20 tool calls per turn
+  (40 when a FinEdge key is saved).
+- `agent/finedge.py`: `BASE_URL = https://data.finedgeapi.com`, 30 s timeout, two
+  retries after 1 s and 2 s for 429 and 5xx, key test symbols `ITC` and `TCS`.
+- `agent/research.py`: symbol list cache 24 h, index feed cache 15 min, at most 6
+  companies per comparison, 20 symbols per quote call.
 - `agent/chatgpt_auth.py`: defaults `CHATGPT_TOKEN_DIR` to `data/chatgpt`; an existing
   environment value is preserved. The installed authenticator overrides store
   tokens in SQLite. Login flow timeout is 15 minutes.
@@ -274,7 +296,7 @@ Other configuration points in code:
 | --- | --- | --- |
 | `data/smarttrader.db` (WAL) | SQLAlchemy models in `models.py` | `broker_config`, `auth_session`, `symtoken`, `master_contract_status`, `agent_setting`, `agent_secret`, `agent_conversation`, `agent_message`, `agent_risk`, `agent_order_audit` |
 | `data/agent.db` | Agno `SqliteDb` | Agno sessions and runs (model context, paused run state) keyed by conversation id |
-| `data/secret.key` | `crypto.py` | Fernet key for `api_secret_enc`, `access_token_enc`, `agent_secret.value_enc` |
+| `data/secret.key` | `crypto.py` | Fernet key for `api_secret_enc`, `access_token_enc`, `agent_secret.value_enc` (ChatGPT tokens and the FinEdge key) |
 | Browser `localStorage` | SPA | Theme, chart layout, drawings, indicators, side rail state (no secrets) |
 
 The full table definitions are documented separately in `docs/schema`.

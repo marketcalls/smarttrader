@@ -2,7 +2,7 @@
 
 This folder documents the HTTP, WebSocket and Server-Sent Events API exposed by the
 SmartTrader backend (FastAPI, `backend/app`), and the outbound calls the backend makes
-to the TradeSmart Online Noren v2 API.
+to the TradeSmart Online Noren v2 API, ChatGPT and the FinEdge Financials API.
 
 The code is the source of truth. Where the code differs from `SPEC.md`, these pages
 describe the code and the difference is listed in [Known discrepancies](#known-discrepancies-with-specmd).
@@ -17,8 +17,8 @@ describe the code and the difference is listed in [Known discrepancies](#known-d
 | [chart.md](chart.md) | Chart intervals and historical candles |
 | [stream.md](stream.md) | Live tick WebSocket (`/api/ws/ticks`) |
 | [orders.md](orders.md) | Chart trading: place, modify, cancel, close position, per-symbol state |
-| [agent.md](agent.md) | AI agent: settings, ChatGPT sign-in, conversations, SSE chat, order approval, risk limits, audit |
-| [broker-integration.md](broker-integration.md) | Outbound calls to TradeSmart (REST, WebSocket, symbol files) and to OpenAI for ChatGPT sign-in |
+| [agent.md](agent.md) | AI agent: settings, FinEdge API key, ChatGPT sign-in, conversations, SSE chat, order approval, risk limits, audit, research tools |
+| [broker-integration.md](broker-integration.md) | Outbound calls to TradeSmart (REST, WebSocket, symbol files), to OpenAI for ChatGPT sign-in, and to the FinEdge Financials API for research |
 
 ## Base URL
 
@@ -144,17 +144,17 @@ Status codes used across the API:
 | 202 | Accepted, work started in the background (master contract download) |
 | 302 | Redirect (OAuth callback only) |
 | 400 | Business validation failed on login input |
-| 401 | No active session (`Not authenticated`), or the broker session expired (`Session expired, please log in again`) |
+| 401 | No active session (`Not authenticated`), or the broker session expired (`Session expired, please log in again`). Never used for a FinEdge problem, because the frontend logs the user out on any 401 |
 | 404 | Unknown resource (symbol not in the master contract, conversation not found, unknown `/api/*` path) |
 | 405 | HTTP method not supported for the requested route |
-| 409 | Conflict with current state (download already running, ChatGPT not signed in, approval no longer pending) |
-| 422 | Request validation failed (FastAPI) or an order input was rejected by SmartTrader's own checks |
+| 409 | Conflict with current state (download already running, ChatGPT not signed in, no FinEdge key saved, approval no longer pending) |
+| 422 | Request validation failed (FastAPI), an order input was rejected by SmartTrader's own checks, or FinEdge rejected the saved API key |
 | 500 | Unhandled server failure; no uniform JSON error contract |
-| 502 | TradeSmart or the model provider answered with an error or could not be reached |
+| 502 | TradeSmart, the model provider or FinEdge answered with an error or could not be reached |
 
 ## Endpoint index
 
-37 application routes: 34 HTTP endpoints under `/api`, one WebSocket, the OAuth callback and the
+41 application routes: 38 HTTP endpoints under `/api`, one WebSocket, the OAuth callback and the
 SPA fallback. Generated OpenAPI and documentation routes are additional.
 
 | # | Method | Path | Auth | Purpose | Doc |
@@ -181,21 +181,25 @@ SPA fallback. Generated OpenAPI and documentation routes are additional.
 | 20 | GET | `/api/agent/status` | yes | ChatGPT sign-in state and current agent settings | [agent.md](agent.md#get-apiagentstatus) |
 | 21 | GET | `/api/agent/settings` | yes | Agent settings plus model, effort and tool lists | [agent.md](agent.md#get-apiagentsettings) |
 | 22 | PUT | `/api/agent/settings` | yes | Update model, reasoning effort, instructions | [agent.md](agent.md#put-apiagentsettings) |
-| 23 | POST | `/api/agent/chatgpt/login` | yes | Start the ChatGPT device-code sign-in | [agent.md](agent.md#post-apiagentchatgptlogin) |
-| 24 | GET | `/api/agent/chatgpt/login` | yes | Poll the sign-in flow | [agent.md](agent.md#get-apiagentchatgptlogin) |
-| 25 | DELETE | `/api/agent/chatgpt/login` | yes | Abandon the sign-in flow | [agent.md](agent.md#delete-apiagentchatgptlogin) |
-| 26 | POST | `/api/agent/chatgpt/logout` | yes | Forget the ChatGPT tokens | [agent.md](agent.md#post-apiagentchatgptlogout) |
-| 27 | POST | `/api/agent/test` | yes | One short completion to test the model | [agent.md](agent.md#post-apiagenttest) |
-| 28 | GET | `/api/agent/conversations` | yes | List conversations | [agent.md](agent.md#get-apiagentconversations) |
-| 29 | GET | `/api/agent/conversations/{conversation_id}` | yes | Conversation transcript | [agent.md](agent.md#get-apiagentconversationsconversation_id) |
-| 30 | PATCH | `/api/agent/conversations/{conversation_id}` | yes | Rename a conversation | [agent.md](agent.md#patch-apiagentconversationsconversation_id) |
-| 31 | DELETE | `/api/agent/conversations/{conversation_id}` | yes | Delete a conversation | [agent.md](agent.md#delete-apiagentconversationsconversation_id) |
-| 32 | POST | `/api/agent/chat` | yes | Send a message, stream the reply (SSE) | [agent.md](agent.md#post-apiagentchat) |
-| 33 | POST | `/api/agent/chat/confirm` | yes | Approve or reject proposed orders, resume the run (SSE) | [agent.md](agent.md#post-apiagentchatconfirm) |
-| 34 | POST | `/api/agent/chat/{run_id}/cancel` | yes | Stop a running turn | [agent.md](agent.md#post-apiagentchatrun_idcancel) |
-| 35 | GET | `/api/agent/risk` | yes | Agent trading switch and risk limits | [agent.md](agent.md#get-apiagentrisk) |
-| 36 | PUT | `/api/agent/risk` | yes | Update the trading switch and limits | [agent.md](agent.md#put-apiagentrisk) |
-| 37 | GET | `/api/agent/orders/audit` | yes | Last 100 agent order audit rows | [agent.md](agent.md#get-apiagentordersaudit) |
+| 23 | GET | `/api/agent/finedge` | yes | FinEdge key status (masked) | [agent.md](agent.md#get-apiagentfinedge) |
+| 24 | PUT | `/api/agent/finedge` | yes | Save the FinEdge API key (encrypted) | [agent.md](agent.md#put-apiagentfinedge) |
+| 25 | DELETE | `/api/agent/finedge` | yes | Remove the FinEdge API key | [agent.md](agent.md#delete-apiagentfinedge) |
+| 26 | POST | `/api/agent/finedge/test` | yes | Test the saved key and report plan coverage | [agent.md](agent.md#post-apiagentfinedgetest) |
+| 27 | POST | `/api/agent/chatgpt/login` | yes | Start the ChatGPT device-code sign-in | [agent.md](agent.md#post-apiagentchatgptlogin) |
+| 28 | GET | `/api/agent/chatgpt/login` | yes | Poll the sign-in flow | [agent.md](agent.md#get-apiagentchatgptlogin) |
+| 29 | DELETE | `/api/agent/chatgpt/login` | yes | Abandon the sign-in flow | [agent.md](agent.md#delete-apiagentchatgptlogin) |
+| 30 | POST | `/api/agent/chatgpt/logout` | yes | Forget the ChatGPT tokens | [agent.md](agent.md#post-apiagentchatgptlogout) |
+| 31 | POST | `/api/agent/test` | yes | One short completion to test the model | [agent.md](agent.md#post-apiagenttest) |
+| 32 | GET | `/api/agent/conversations` | yes | List conversations | [agent.md](agent.md#get-apiagentconversations) |
+| 33 | GET | `/api/agent/conversations/{conversation_id}` | yes | Conversation transcript | [agent.md](agent.md#get-apiagentconversationsconversation_id) |
+| 34 | PATCH | `/api/agent/conversations/{conversation_id}` | yes | Rename a conversation | [agent.md](agent.md#patch-apiagentconversationsconversation_id) |
+| 35 | DELETE | `/api/agent/conversations/{conversation_id}` | yes | Delete a conversation | [agent.md](agent.md#delete-apiagentconversationsconversation_id) |
+| 36 | POST | `/api/agent/chat` | yes | Send a message, stream the reply (SSE) | [agent.md](agent.md#post-apiagentchat) |
+| 37 | POST | `/api/agent/chat/confirm` | yes | Approve or reject proposed orders, resume the run (SSE) | [agent.md](agent.md#post-apiagentchatconfirm) |
+| 38 | POST | `/api/agent/chat/{run_id}/cancel` | yes | Stop a running turn | [agent.md](agent.md#post-apiagentchatrun_idcancel) |
+| 39 | GET | `/api/agent/risk` | yes | Agent trading switch and risk limits | [agent.md](agent.md#get-apiagentrisk) |
+| 40 | PUT | `/api/agent/risk` | yes | Update the trading switch and limits | [agent.md](agent.md#put-apiagentrisk) |
+| 41 | GET | `/api/agent/orders/audit` | yes | Last 100 agent order audit rows | [agent.md](agent.md#get-apiagentordersaudit) |
 
 FastAPI also serves its generated OpenAPI document at `/openapi.json` and the interactive docs at
 `/docs` and `/redoc`, because they are registered before the SPA fallback.
@@ -208,8 +212,10 @@ FastAPI also serves its generated OpenAPI document at `/openapi.json` and the in
 | `GET /tradesmart/callback` success | Deactivates old sessions, inserts a session row, starts the master contract download thread |
 | `POST /api/master-contract/download` | Starts the master contract download thread |
 | `POST /api/orders`, `/modify`, `/cancel`, `/close-position` | Placement, modification or cancellation requests on the TradeSmart account |
-| `POST /api/agent/chat`, `/chat/confirm` | Writes conversation and message rows, Agno session history in `data/agent.db`, and (when approved) real orders plus `agent_order_audit` rows |
+| `POST /api/agent/chat`, `/chat/confirm` | Writes conversation and message rows, Agno session history in `data/agent.db`, FinEdge calls when the model uses a research tool, and (when approved) real orders plus `agent_order_audit` rows |
 | `POST /api/agent/chatgpt/login` | Starts a background thread that polls OpenAI until the device code is approved, then stores encrypted tokens |
+| `PUT` / `DELETE /api/agent/finedge` | Writes or deletes the encrypted `agent_secret` row `finedge_api_key` and clears the FinEdge in-process cache |
+| `POST /api/agent/finedge/test` | Two outbound FinEdge company profile calls (ITC, then TCS) |
 
 ## Known discrepancies with SPEC.md
 

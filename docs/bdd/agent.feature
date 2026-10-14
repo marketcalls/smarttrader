@@ -31,6 +31,8 @@ Feature: AI trading agent: settings, ChatGPT sign-in, streaming chat, tools and 
     And the response field "tools" lists "search_symbols", "get_quote", "get_history", "get_technicals", "get_funds", "get_positions", "get_holdings", "get_order_book", "get_trade_book" and "get_master_contract_status"
     And the response field "order_tools" lists "place_order", "modify_order" and "cancel_order"
     And the response field "trading_enabled" is false
+    And the response field "research_tools" lists the 14 FinEdge research tools described in research.feature
+    And the response field "finedge" is {"configured": false, "masked_key": null, "updated_at": null} when no FinEdge API key is saved
 
   @req-AGENT-2
   Scenario: Saving settings trims the instructions
@@ -245,6 +247,7 @@ Feature: AI trading agent: settings, ChatGPT sign-in, streaming chat, tools and 
   Scenario: Without trading enabled the agent gets only the ten read tools and a read only rule
     Given ChatGPT sign-in state is signed in
     And agent trading is switched off
+    And no FinEdge API key is saved
     When a chat turn starts
     Then the agent tools are "search_symbols", "get_quote", "get_history", "get_technicals", "get_funds", "get_positions", "get_holdings", "get_order_book", "get_trade_book" and "get_master_contract_status"
     And the system prompt says trading is switched off and the user can switch it on in Agent settings
@@ -614,6 +617,7 @@ Feature: AI trading agent: settings, ChatGPT sign-in, streaming chat, tools and 
   Scenario: With trading on the agent gets the order tools and the trading rule
     Given ChatGPT sign-in state is signed in
     And agent trading is switched on
+    And no FinEdge API key is saved
     When a chat turn starts
     Then the agent tools are the ten read tools plus "place_order", "modify_order" and "cancel_order"
     And the system prompt tells the model to quote first, propose exactly what was asked and never retry a rejected or refused order

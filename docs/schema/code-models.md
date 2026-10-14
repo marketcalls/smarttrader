@@ -25,7 +25,7 @@ NULL; primary-key declarations also provide NOT NULL without an explicit
 | `SymToken` | `symtoken` | smarttrader.db | `id` | `__table_args__` declares the three indexes |
 | `MasterContractStatus` | `master_contract_status` | smarttrader.db | `id` (always 1) | `status` default `idle`, `total_records` default 0 |
 | `AgentSetting` | `agent_setting` | smarttrader.db | `id` (always 1) | |
-| `AgentSecret` | `agent_secret` | smarttrader.db | `name` | `value_enc` encrypted |
+| `AgentSecret` | `agent_secret` | smarttrader.db | `name` | `value_enc` encrypted; rows `chatgpt_oauth` and `finedge_api_key` |
 | `AgentConversation` | `agent_conversation` | smarttrader.db | `id` (uuid hex) | |
 | `AgentMessage` | `agent_message` | smarttrader.db | `id` | `conversation_id` has `index=True`; `content` default `''` |
 | `AgentRisk` | `agent_risk` | smarttrader.db | `id` (always 1) | Defaults: off, 50,000, 500, 20, `NSE,BSE` |
@@ -93,6 +93,7 @@ here are the effective column limits, since the DDL has no length checks.
 | --- | --- | --- | --- |
 | `LoginRequest` | `routers/auth.py` | `api_key: str`, `api_secret: str \| None = None`, `redirect_url: str` (router checks non-empty key and http(s) URL) | `broker_config` |
 | `SettingsBody` | `routers/agent.py` | `model: str` (1 to 80), `reasoning_effort: str \| None = None`, `instructions: str \| None = None` (max 4,000); router checks model catalogue and effort enum | `agent_setting` |
+| `FinEdgeKeyBody` | `routers/agent.py` | `api_key: str` (8 to 256 characters, `pattern=r"^\S+$"` so no whitespace anywhere; not trimmed). Any violation is a 422 validation list | `agent_secret` row `finedge_api_key` (encrypted by `finedge.write_key`) |
 | `RenameBody` | `routers/agent.py` | `title: str` (1 to 120 before trimming); whitespace-only title stores empty text | `agent_conversation.title` |
 | `ChatBody` | `routers/agent.py` | `message: str` (1 to 16,000 before trimming); whitespace-only input stores empty text; `conversation_id: str \| None = None` (no length bound) | `agent_conversation`, `agent_message` |
 | `ConfirmBody` | `routers/agent.py` | `conversation_id: str` (1 to 64), `run_id: str` (1 to 64), `decisions: dict[str, bool]` (tool_call_id to approve) | `agent_message.pending_json`, `agent_order_audit` |
@@ -113,6 +114,7 @@ orders are audited.
 | `Placed` (frozen) | `broker/order_service.py` | `order_id`, `sent_price`, `ltp` | Return value of a UI order placement. Not stored. |
 | `Instrument` | `broker/stream.py` | `symbol`, `exchange`, `key` (`EXCH\|token`) | Built from a `symtoken` row by `routers/stream.py:_lookup` for tick subscriptions. |
 | `TickState` | `broker/stream.py` | `ltp`, `volume` | Running state of one touchline subscription. |
+| `FinEdgeError` (Exception) | `agent/finedge.py` | `status_code` (HTTP status, 0 when unreachable), `message` (never contains the key); properties `invalid_key` (401 with `ER006`) and `not_in_plan` (401 or 403 otherwise) | Raised by the FinEdge client; mapped to 422 or 502 by the key test route and to text by the research tools. Not stored. |
 | `LoginFlow` | `agent/chatgpt_auth.py` | `flow_id`, `user_code`, `verification_url`, `expires_at`, `state` (`pending`, `complete`, `error`, `expired`), `error` | In-memory ChatGPT device-code sign-in; on success the tokens go to `agent_secret`. |
 | `Row` (type alias) | `broker/master_contract.py` | `dict[str, Any]` with the 11 `symtoken` columns except `id` | Parser output, bulk-inserted into `symtoken`. |
 | `BrowserChannel` (Protocol) | `broker/stream.py` | `send_json`, `receive_json` | Abstraction over the browser WebSocket. |
@@ -122,7 +124,7 @@ orders are audited.
 | Column | Shape documented in |
 | --- | --- |
 | `master_contract_status.exchanges_json` | [core-tables.md](core-tables.md#master_contract_status) |
-| `agent_secret.value_enc` (after decryption) | [agent-tables.md](agent-tables.md#agent_secret) |
+| `agent_secret.value_enc` (row `chatgpt_oauth`, after decryption; `finedge_api_key` holds a plain string) | [agent-tables.md](agent-tables.md#agent_secret) |
 | `agent_message.tools_json`, `usage_json`, `pending_json` | [agent-tables.md](agent-tables.md#agent_message) |
 | `agent_order_audit.args_json` | [agent-tables.md](agent-tables.md#agent_order_audit) |
 | `agno_sessions.*_data`, `agno_runs.run_data` | Agno internal, see [agent-db.md](agent-db.md) |

@@ -1,20 +1,26 @@
 # AI agent
 
 Source: `backend/app/routers/agent.py`, `backend/app/agent/builder.py`, `backend/app/agent/tools.py`,
-`backend/app/agent/trading.py`, `backend/app/agent/chatgpt_auth.py`.
-Tests: `backend/tests/test_agent.py`, `backend/tests/test_orders.py`.
+`backend/app/agent/trading.py`, `backend/app/agent/chatgpt_auth.py`, `backend/app/agent/finedge.py`,
+`backend/app/agent/research.py`.
+Tests: `backend/tests/test_agent.py`, `backend/tests/test_orders.py`, `backend/tests/test_research.py`.
 
 Back to the [API index](README.md).
 
 The agent is an Agno `Agent` driving a ChatGPT-subscription model through LiteLLM's `chatgpt/<model>`
 provider. It reads market and account data from TradeSmart with the logged-in user's session and, when
-trading is switched on, can propose orders that the user must approve in the chat.
+trading is switched on, can propose orders that the user must approve in the chat. When a FinEdge
+Financials API key is saved, it also gets 14 fundamental research tools (company profiles, financial
+statements, ratios, valuation history, peers, shareholding, dividends, filings, index data).
 
 Every route under `/api/agent` requires a SmartTrader session (router-level `require_session`), so all
 of them can return `401 {"detail": "Not authenticated"}`. This is separate from the ChatGPT sign-in,
-which is required only for `/test`, `/chat` and `/chat/confirm` (409 otherwise).
+which is required only for `/test`, `/chat` and `/chat/confirm` (409 otherwise). A FinEdge problem
+is never answered with 401 (the frontend logs the user out on any 401): a rejected FinEdge key is
+422, a missing key 409, and an unreachable FinEdge or any other FinEdge error 502.
 
-Settings, ChatGPT tokens, risk limits, transcripts and audit rows are shared application state.
+Settings, ChatGPT tokens, the FinEdge key, risk limits, transcripts and audit rows are shared
+application state.
 Conversation and audit routes do not filter by broker user id; a later broker login can access the
 previous account's saved conversations. Handled endpoint errors are listed below; unhandled setup,
 storage or provider failures can return HTTP 500 under the [common error contract](README.md#error-format).
@@ -89,6 +95,27 @@ Response `200`:
     {"name": "get_trade_book", "description": "Today's trades"},
     {"name": "get_master_contract_status", "description": "Symbol master status"}
   ],
+  "research_tools": [
+    {"name": "search_companies", "description": "Find listed companies by name, NSE symbol or BSE code"},
+    {"name": "get_company_profile", "description": "Business, sector, industry, market cap and annual report"},
+    {"name": "get_financial_statements", "description": "P&L, balance sheet and cash flow in Rs crore"},
+    {"name": "get_financial_ratios", "description": "Margins, returns, leverage, liquidity and efficiency"},
+    {"name": "get_growth_metrics", "description": "3 and 5 year growth, average returns and cash flow totals"},
+    {"name": "get_stock_quotes", "description": "Delayed price, 52 week range and market cap"},
+    {"name": "get_price_performance", "description": "Returns, CAGR, volatility, drawdown and moving averages"},
+    {"name": "get_valuation_history", "description": "PE, PB, PS history and today's percentile"},
+    {"name": "get_peers", "description": "Peer companies ranked by market cap"},
+    {"name": "compare_companies", "description": "Side by side fundamentals for 2 to 6 companies"},
+    {"name": "get_shareholding", "description": "Promoter, institutional and public holding trend"},
+    {"name": "get_dividends_and_actions", "description": "Dividend history, yield, bonuses and splits"},
+    {"name": "get_announcements", "description": "Recent filings, credit ratings, call transcripts"},
+    {"name": "get_index_overview", "description": "Index level, valuation and returns"}
+  ],
+  "finedge": {
+    "configured": true,
+    "masked_key": "********<LAST_4>",
+    "updated_at": "2026-10-14T10:05:12+05:30"
+  },
   "order_tools": [
     {"name": "place_order", "description": "Place an order after your approval"},
     {"name": "modify_order", "description": "Modify an open order after your approval"},
@@ -102,7 +129,19 @@ Response `200`:
 reverse string order. The exact list depends on the installed LiteLLM version; the values above are
 illustrative.
 
-Errors: 401 only. Side effects: same row creation as `/status`.
+| Field | Type | Notes |
+| --- | --- | --- |
+| `model`, `reasoning_effort`, `instructions` | | As in `/status` |
+| `models` | array of string | Selectable models |
+| `reasoning_efforts` | array of string | `low`, `medium`, `high` |
+| `tools` | array of `{name, description}` | The 10 TradeSmart read tools, always present |
+| `research_tools` | array of `{name, description}` | The 14 FinEdge research tools (`research.RESEARCH_TOOL_DESCRIPTIONS`). Always listed; the agent only gets them when `finedge.configured` is true |
+| `finedge` | object | FinEdge key status, same shape as [GET /api/agent/finedge](#get-apiagentfinedge). Never contains the key |
+| `order_tools` | array of `{name, description}` | The 3 order tools, present in a chat only when trading is on |
+| `trading_enabled` | boolean | Agent trading switch |
+
+Errors: 401 only. Side effects: same row creation as `/status`. Reading `finedge` decrypts the stored
+key in memory to build the mask; no call to FinEdge is made.
 
 ### PUT /api/agent/settings
 
@@ -137,6 +176,142 @@ Errors:
 | 422 | validation list | Missing `model` or length limits |
 
 Side effects: updates `agent_setting` (id 1) and `updated_at`. Applies to the next turn.
+
+---
+
+## FinEdge API key (fundamental research)
+
+The FinEdge Financials API (`https://data.finedgeapi.com`) supplies the agent's research tools. The
+user enters the key on the Agent settings page. It is stored Fernet-encrypted in the `agent_secret`
+table (row `finedge_api_key`, see [agent-tables.md](../schema/agent-tables.md#agent_secret)), never in a
+file or environment variable, and is never returned to the browser: responses only carry a masked
+form. The outbound calls are described in
+[broker-integration.md](broker-integration.md#finedge-financials-api-research-tools).
+
+Key status object (`finedge.key_status`), returned by GET, PUT and DELETE `/api/agent/finedge` and
+embedded as `finedge` in GET settings:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `configured` | boolean | true when a row exists and decrypts to a non-empty key |
+| `masked_key` | string or null | 8 asterisks plus the last 4 characters (`********<LAST_4>`); only 8 asterisks for a key of exactly 8 characters; null when not configured |
+| `updated_at` | string or null | IST ISO 8601 time of the last save; null when not configured |
+
+None of these routes answers 401 for a FinEdge problem. The frontend treats any 401 as an expired
+SmartTrader session and signs the user out, so a rejected FinEdge key is reported as 422.
+
+### GET /api/agent/finedge
+
+Whether a FinEdge key is saved.
+
+- Auth required: yes
+- Request: none
+
+Response `200` with a key saved:
+
+```json
+{"configured": true, "masked_key": "********<LAST_4>", "updated_at": "2026-10-14T10:05:12+05:30"}
+```
+
+Response `200` without a key:
+
+```json
+{"configured": false, "masked_key": null, "updated_at": null}
+```
+
+Errors: 401 only (no SmartTrader session). Side effects: none; no call to FinEdge.
+
+### PUT /api/agent/finedge
+
+Saves (or replaces) the FinEdge API key.
+
+- Auth required: yes
+
+Request body (`FinEdgeKeyBody`):
+
+| Field | Type | Required | Constraints | Notes |
+| --- | --- | --- | --- | --- |
+| `api_key` | string | yes | length 8 to 256, no whitespace anywhere (pattern `^\S+$`) | Stored as given, not trimmed |
+
+Example:
+
+```json
+{"api_key": "<FINEDGE_API_KEY>"}
+```
+
+Response `200`: the key status object.
+
+```json
+{"configured": true, "masked_key": "********<LAST_4>", "updated_at": "2026-10-14T10:05:12+05:30"}
+```
+
+Errors:
+
+| Status | `detail` | When |
+| --- | --- | --- |
+| 422 | validation list | `api_key` missing, shorter than 8 or longer than 256 characters, or containing a space, tab or newline |
+
+Side effects:
+
+- Encrypts the key and inserts or updates the `agent_secret` row `finedge_api_key` (sets `updated_at`).
+- Clears the FinEdge in-process cache (symbol list, index feed, index returns).
+- Logs `FinEdge API key saved` (without the key).
+- The key is not checked against FinEdge here; use `POST /api/agent/finedge/test`.
+- The next chat turn gets the research tools and the research prompt rules, with a tool call limit
+  of 40 instead of 20.
+
+### DELETE /api/agent/finedge
+
+Removes the saved FinEdge key.
+
+- Auth required: yes
+- Request: none
+
+Response `200` (also when no key was saved):
+
+```json
+{"configured": false, "masked_key": null, "updated_at": null}
+```
+
+Errors: 401 only.
+
+Side effects: deletes the `agent_secret` row `finedge_api_key`, clears the FinEdge in-process cache and
+logs `FinEdge API key removed`. The next chat turn has no research tools and its prompt tells the model
+to suggest adding a key in Agent settings when fundamentals are asked for.
+
+### POST /api/agent/finedge/test
+
+Checks the saved key with two small company profile calls: `company-profile/ITC` (in every FinEdge
+plan, including the free Basic plan) and then `company-profile/TCS` (paid plans only). The
+`/healthcheck` endpoint is not used because it answers 200 even for a wrong key.
+
+- Auth required: yes
+- Request: none (the saved key is used; a key cannot be tested before it is saved)
+
+Response `200`:
+
+```json
+{"ok": true, "coverage": "all", "sample_company": "ITC Ltd", "latency_ms": 412}
+```
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `ok` | boolean | Always true on 200 |
+| `coverage` | string | `all` when the TCS profile is readable (paid plan); `sample` when FinEdge refuses TCS as outside the plan (401 `ER002` or 403), as on the free Basic plan that only covers ITC, RELIANCE and HDFCBANK |
+| `sample_company` | string or null | `name` from the ITC profile |
+| `latency_ms` | integer | Time of the ITC call in milliseconds, including any retries |
+
+Errors:
+
+| Status | `detail` | When |
+| --- | --- | --- |
+| 409 | `Save a FinEdge API key first.` | No key saved, or the stored value cannot be decrypted |
+| 422 | `FinEdge rejected the API key. Check it and try again.` | FinEdge answered 401 with `ER006 - missing or invalid token` |
+| 502 | `FinEdge is unreachable. Try again in a minute.` | Network error or timeout (30 s per attempt) |
+| 502 | `FinEdge error (<status>): <FinEdge text>` | Any other FinEdge failure, for example ITC itself refused with 401 `ER002 - user not authorized to view this content`, a 5xx after retries, a 404 from the TCS probe, or a body that is not JSON. The text is at most 200 characters and has the key masked as `***` |
+
+Side effects: two outbound GETs to FinEdge (more when FinEdge answers 429 or 5xx and the call is
+retried). Runs in the thread pool. Nothing is written.
 
 ---
 
@@ -522,11 +697,18 @@ Side effects:
 - Creates the `agent_conversation` row when needed; sets its `model` and `updated_at`.
 - Inserts the user `agent_message` row.
 - Marks every still-`pending` approval in this conversation as `expired` (a new question abandons it).
-- Builds the agent: system prompt (read-only or trading rules), extra instructions, IST date, the last 8
-  runs of Agno history from `backend/data/agent.db`, at most 20 tool calls per turn. The 10 read tools
-  are always present; the 3 order tools are added only when `trading_enabled` is true.
+- Builds the agent: system prompt (read-only or trading rules), research rules, extra instructions,
+  IST date, the last 8 runs of Agno history from `backend/data/agent.db`. The 10 read tools are always
+  present; the 14 FinEdge research tools are added when a FinEdge key is saved (`finedge.read_key`
+  returns a key); the 3 order tools are added only when `trading_enabled` is true. With research tools
+  the prompt carries `RESEARCH_RULES` (how to use the FinEdge tools, cite units, periods and
+  consolidated or standalone basis, the research report and recommendation structure, the education
+  disclaimer) and the turn allows at most 40 tool calls; without them the prompt carries
+  `RESEARCH_OFF_RULE` (tell the user to add a FinEdge key in Agent settings) and the limit is 20.
 - Model requests go to the ChatGPT backend through LiteLLM. Tool calls go to TradeSmart with the user's
-  session (see [broker-integration.md](broker-integration.md#calls-made-by-the-ai-agent-tools)).
+  session (see [broker-integration.md](broker-integration.md#calls-made-by-the-ai-agent-tools)) and,
+  for research tools, to FinEdge with the saved key (see
+  [broker-integration.md](broker-integration.md#finedge-financials-api-research-tools)).
 - Agno writes its own session and run records to `backend/data/agent.db`.
 - On a pause for approval: one `agent_order_audit` row with status `proposed` per requirement, and the
   saved assistant message carries `pending` with state `pending`.
@@ -777,6 +959,37 @@ The shared wrapper turns broker expiry, broker errors and other exceptions into 
 it does not deactivate the SmartTrader session. Neither list truncation nor tool preview truncation
 provides pagination. The first 50 rows are not necessarily the newest; no local ordering is applied.
 
+### Research tool contracts (FinEdge)
+
+Present only when a FinEdge key is saved. Each tool is a closure over the key, so the key never
+appears in the prompt or the tool arguments. Symbols are NSE symbols or BSE codes with no exchange
+(for example `ITC` or `500875`). Results are JSON strings with `"source": "FinEdge"` and a `units`
+note; money is converted from absolute rupees to Rs crore and ratios to percent where stated.
+`consolidated=True` falls back to standalone accounts when a company has none.
+
+| Tool and arguments | Result and bounds |
+| --- | --- |
+| `search_companies(query, limit=10)` | Matches from the FinEdge symbol list (cached 24 h): exact symbol or code first, then prefix, then all words in the name. `limit` 1 to 25. Rows: `symbol`, `name`, `nse_code`, `bse_code`, `has_consolidated` |
+| `get_company_profile(symbol)` | Name, codes, macro sector, sector, industry, sub industry, market cap (Rs crore), website, description cut to 900 characters, latest annual report year and link |
+| `get_financial_statements(symbol, statement="pl", period="annual", periods=5, consolidated=True)` | `statement` `pl`, `bs` or `cf`; `period` `annual` or `quarterly`, plus `ttm` and `halfyearly` for `pl`, `ytd` for `bs` and `cf`. `periods` 1 to 12, oldest first, labelled from `period_end` (for example `Mar 2026`). Adds `eps_rs`, `totalBorrowings` and `netDebt` (bs), `freeCashFlow` (cf), and year on year revenue and profit growth (pl; quarterly compares with four quarters back). Banks and insurers get their own line items, up to 40 |
+| `get_financial_ratios(symbol, years=5, consolidated=True)` | Profitability (percent), leverage, liquidity and efficiency ratios per year plus TTM. `years` 1 to 10 |
+| `get_growth_metrics(symbol, consolidated=True)` | 3 and 5 year CAGRs, 3 and 5 year averages (percent), 3 year cash flow totals (Rs crore) |
+| `get_stock_quotes(symbols)` | Up to 20 comma separated symbols. Delayed price, change percent, OHLC, volume, 52 week range, percent below the 52 week high, market cap. Missing symbols listed in `not_found` |
+| `get_price_performance(symbol, years=3, benchmark="NIF50")` | From adjusted daily closes: 1M to 5Y returns, CAGR, 1 year annualised volatility, max drawdown, 50 and 200 day averages, average volumes, last 12 monthly closes, and benchmark index returns. `years` 1 to 10 |
+| `get_valuation_history(symbol, years=5, consolidated=True)` | Yearly PE, PB, PS, P/FCF and average price, plus current multiple against its daily range since `years` back (median, min, max, percentile). `years` 1 to 8, data starts in 2018 |
+| `get_peers(symbol, group="industry", max_peers=8)` | `group` `sub_industry`, `industry`, `sector` or `macro_sector`. Peers ranked by market cap with price and change; quotes priced under Rs 1 are ranked last because FinEdge has penny quotes with impossible market caps. `max_peers` 1 to 20 |
+| `compare_companies(symbols, consolidated=True)` | 2 to 6 symbols. Per company: latest FY revenue and profit, 3 and 5 year CAGRs, margins, ROE, ROCE, debt to equity, PE, PB, price, market cap. A company outside the plan gets `error` instead; mixed bases add a `note` |
+| `get_shareholding(symbol, quarters=6, top_holders=0)` | Holding by category per quarter (1 to 12), total shareholders, promoter pledge, and optionally the largest named holders (up to 15) ranked by shares held, with FinEdge fractions converted to percent |
+| `get_dividends_and_actions(symbol, years=5)` | Latest dividend, TTM dividend per share and yield, per year totals (1 to 15 years), bonus, split and rights actions |
+| `get_announcements(symbol, days=90, kind="announcements", limit=15)` | `kind` `announcements`, `credit_ratings`, `transcripts` or `presentations`. Filings newest first with category, description (300 characters) and PDF link. Routine noise (trading window, share certificate notices, newspaper ads) is dropped from `announcements`. `days` 1 to 365, `limit` 1 to 30 |
+| `get_index_overview(index="NIF50")` | Matched by index code, exact name or name substring. Close, change, PE, PB, dividend yield and 1M to 10Y returns |
+
+Failures become text for the model: a rejected key gives `Error: FinEdge rejected the API key. Ask
+the user to update it in Agent settings.`; a company or data outside the plan gives `Not available:
+...` with the note that the free Basic plan only covers ITC, RELIANCE and HDFCBANK; a FinEdge 404 gives
+`Not found: ...`; a network failure `Error: FinEdge is unreachable (...). Try again in a minute.`; any
+other exception `Error: <tool> failed (<ExceptionClass>).` These count as `ok: false` in `tool_end`.
+
 ---
 
 ## Notes and possible issues
@@ -798,3 +1011,10 @@ provides pagination. The first 50 rows are not necessarily the newest; no local 
   broker, without reserving a slot. Concurrent approvals can both pass. A timeout is logged as
   `failed` even if the broker accepted the order; it therefore does not block a retry as a duplicate.
   There is no durable idempotency key or unknown-outcome reconciliation process.
+- `PUT /finedge` stores any well-formed key without asking FinEdge, so a wrong key is only found by
+  `POST /finedge/test` or when a research tool returns the rejected-key error. The test route cannot
+  check a key before it is saved.
+- The FinEdge key, like the ChatGPT tokens, is shared application state: it is not tied to the
+  TradeSmart account that saved it.
+- The FinEdge process cache is per process and is cleared only on key save or removal; with more than
+  one worker each keeps its own copy.

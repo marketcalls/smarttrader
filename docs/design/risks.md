@@ -16,6 +16,8 @@ lists the evidence, the impact and a recommendation. Severity: High, Medium, Low
 | R7 | Price serialization changes approved prices; close-position trusts submitted exposure | High |
 | R8 | No durable order idempotency or reconciliation for uncertain broker outcomes | High |
 | R9 | Incomplete upstream data can appear as zero exposure or a successful master refresh | High |
+| R10 | FinEdge research: undocumented response fields, Basic plan coverage, key in the query string, recommendations that are not advice | Medium |
+| R11 | Agent settings chunk is a hand patch of the minified build: lost on rebuild, stale in browser caches | Medium |
 
 ## 2. Detailed findings
 
@@ -34,6 +36,8 @@ lists the evidence, the impact and a recommendation. Severity: High, Medium, Low
   the API used by the bundle (listed in [frontend.md](frontend.md)) as frozen. As a
   last resort, the bundle could be de-minified, but that would not recover the
   original component structure.
+- Update: the FinEdge key card was added by editing the minified settings chunk
+  directly, which is the only way to change the UI today. See R11.
 
 ### R2. CORS and CSRF exposure (High)
 
@@ -160,6 +164,67 @@ lists the evidence, the impact and a recommendation. Severity: High, Medium, Low
   atomically. Reject ambiguous `(symbol, exchange)` lookups; BFO normalization can
   collapse underlying names containing digits (see the schema risk document).
 
+### R10. FinEdge research data and recommendations (Medium)
+
+- Evidence (`agent/finedge.py`, `agent/research.py`, `agent/builder.py`):
+  - FinEdge response fields (`revenueFromOperations`, `profitLossForPeriod`,
+    `current_price`, `high52`, `columns` and `rows` in shareholding, and so on) and
+    error codes are not formally documented. The code was written against live
+    responses: `ER006` means a bad key, `ER002` means data outside the plan, and
+    `/healthcheck` answers 200 for any key. Missing fields become `null`, and a
+    renamed field would silently drop a figure rather than fail.
+  - The free Basic plan covers only ITC, RELIANCE and HDFCBANK. Other companies are
+    refused as not in plan; one uncovered symbol makes FinEdge refuse a whole batch
+    quote, so the tools fall back to one quote per symbol (more calls, slower).
+    The key test reports `sample` coverage from a single probe (TCS); it does not
+    prove which other datasets the plan includes.
+  - FinEdge only accepts the key as a `token` query parameter. It stays out of logs
+    only while the `httpx` logger is at WARNING and while errors are built from the
+    status code and masked FinEdge text.
+  - Recommendations (Buy, Accumulate, Hold, Reduce or Sell with a medium term or
+    long term horizon) are produced by the model under prompt rules only. Nothing in
+    code checks the numbers, the rating, the horizon or the disclaimer. Prices from
+    FinEdge are delayed 15 to 30 minutes, and statements lag the reporting cycle.
+    The output is a research view for education, not investment advice, and the
+    app is not a SEBI registered adviser.
+  - The key is not configured through `.env`: it is entered only on the Agent
+    settings page and stored Fernet-encrypted in `agent_secret`. Setting a
+    `FINEDGE_API_KEY` or similar environment variable has no effect.
+- Impact: a FinEdge schema change can produce reports with missing or wrong figures
+  without an error; a Basic plan user sees most companies as "Not available"; a user
+  may act on a model-written rating as if it were advice; raising the httpx log
+  level would write the key to the console.
+- Recommendation: add a contract test against a recorded FinEdge sample and a live
+  smoke check behind a flag; surface plan coverage in the agent status; keep the
+  disclaimer and the data date in every recommendation (consider a code-level check
+  or a fixed footer added by the UI); never raise the httpx log level in production;
+  ask FinEdge for header-based authentication.
+
+### R11. Hand-patched settings chunk (Medium)
+
+- Evidence: `frontend/dist/assets/AgentConfigPage-C4TKen9_.js` was edited in place to
+  add the FinEdge API key card and the research tools rows (it imports the main
+  chunk's fetch wrapper as `Qe` and uses the query key `["agent","finedge"]`). The
+  file name, which is a content hash, was kept so that `index-*.js` still loads it.
+  `frontend/src` is missing, so the change exists nowhere in source.
+- Impact:
+  - Any rebuild from recovered source (or restoring the original chunk) removes the
+    card and the research tools list; the backend keeps working, but the user can no
+    longer save, test or remove a FinEdge key from the UI.
+  - Because the hashed file name did not change, a browser that had cached the old
+    chunk could keep showing the settings page without the card. This happened in
+    practice. `spa_fallback` in `main.py` now sends `Cache-Control: no-cache` with
+    every frontend file, so the browser revalidates with the ETag (a cheap 304 when
+    unchanged) and picks up a patched chunk. A copy cached before that change still
+    needs one hard reload (Ctrl+F5).
+  - A minified hand patch has no type checking or tests; a mistake shows up only in
+    the browser.
+- Recommendation: when the source is recovered, re-implement the card and the research
+  tools rows in `src` before building, and use the API in [../api/agent.md](../api/agent.md)
+  as the contract. Until then, keep the patched file under version control; the
+  original chunk can be restored from git if the patch must be reverted. Tell users
+  to hard reload `/agent/config` once after the update.
+
 ## 3. Other technical debt
 
 | Item | Evidence | Recommendation |
@@ -195,7 +260,8 @@ lists the evidence, the impact and a recommendation. Severity: High, Medium, Low
 | Agent risk check | Lists six checks for orders | All six apply to `place_order` only; `modify_order` and `cancel_order` check fewer |
 | Agent status and settings payloads | Fewer fields | Extra fields (`provider`, `instructions`, `trading_enabled`, `order_tools`, `reasoning_efforts`) |
 | Run command | Original setup used `uv run uvicorn ...` | Root README now uses `uv run python -m uvicorn ...` for this checkout |
-| Frontend source | Described as React source | Only the build exists |
+| Frontend source | Described as React source | Only the build exists; the settings chunk carries a hand patch (R11) |
+| Fundamental research | Not in the spec | FinEdge research tools, key card and routes (R10, R11) |
 
 ## 5. Recommended next steps (priority order)
 
@@ -210,3 +276,5 @@ lists the evidence, the impact and a recommendation. Severity: High, Medium, Low
 7. Fix stale login writes, wire-price precision and close-position validation.
 8. Introduce durable order intents, reconciliation, safe read retries and explicit
    degraded-data states before treating this as reliable live-trading software.
+9. Port the FinEdge card into recovered frontend source (R11) and add a FinEdge
+   contract test and a plan coverage indicator (R10).

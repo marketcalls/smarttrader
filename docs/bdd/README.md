@@ -9,7 +9,7 @@ These files are documentation first. They are written so they can be bound to st
 definitions later (for example with pytest-bdd against FastAPI's `TestClient` and the
 test doubles already used in `backend/tests`), but no step definitions exist yet.
 
-Verification on 2026-10-14: the existing backend suite passed 69 cases from 64 test
+Verification on 2026-10-14: the existing backend suite passed 94 cases from 86 test
 functions using `uv run --offline --no-sync python -m pytest -q` with
 `LITELLM_LOCAL_MODEL_COST_MAP=True`. This does not execute these Gherkin specifications.
 
@@ -25,7 +25,8 @@ functions using `uv run --offline --no-sync python -m pytest -q` with
 | `orders.feature` | Place, modify, cancel, close position, order and position lines, validation, broker rejection | 31 | `routers/orders.py`, `broker/order_service.py`, `broker/orders.py` |
 | `agent.feature` | Agent settings, ChatGPT sign-in, streaming chat, tools, provider errors, conversations, risk limits, order approval and audit | 60 | `routers/agent.py`, `agent/*.py` |
 | `platform.feature` | Health, SPA fallback, CORS, encryption at rest, log redaction, startup | 9 | `main.py`, `config.py`, `crypto.py`, `db.py` |
-| Total | | 195 | |
+| `research.feature` | FinEdge API key save, test and remove, research tools, statements, ratios, quotes, peers, comparisons, filings, research reports and buy or sell research views | 29 | `routers/agent.py`, `agent/finedge.py`, `agent/research.py`, `agent/builder.py` |
+| Total | | 224 | |
 
 A Scenario Outline counts as one scenario in these numbers; its Examples rows are the
 individual cases.
@@ -65,12 +66,14 @@ placeholders or the fake values already used in `backend/tests`:
 | `<conversation_id>` | Id returned in the chat `start` frame |
 | `<broker rejection reason>` | Any `emsg` text TradeSmart returns; the backend passes it through verbatim |
 | `me@example.com` | ChatGPT account email in the ID token test double |
+| `fe-test-key-12345678` | FinEdge API key test fixture from `tests/test_research.py` (masked as `********5678`) |
+| `<FINEDGE_API_KEY>` | A real FinEdge API key; never written into these files |
 
 ## Tagging conventions
 
 | Tag | Meaning |
 | --- | --- |
-| `@auth`, `@master_contract`, `@funds`, `@chart`, `@stream`, `@orders`, `@agent`, `@platform` | Area tag, set once at Feature level so every scenario inherits it |
+| `@auth`, `@master_contract`, `@funds`, `@chart`, `@stream`, `@orders`, `@agent`, `@platform`, `@research` | Area tag, set once at Feature level so every scenario inherits it |
 | `@smoke` | Candidate happy path for a future BDD smoke suite; `--tags @smoke` is not currently an executable repository command |
 | `@negative` | Validation errors, broker rejections, expired sessions, network failures and other failure paths |
 | `@ux` | Frontend behaviour read from the built bundle (no source available) |
@@ -79,7 +82,8 @@ placeholders or the fake values already used in `backend/tests`:
 Every `@req-*` tag is a user story or non-functional requirement id defined in the PRD.
 When a PRD story is added, changed or removed, update the tags here to match. Live quotes
 are product scope of the chart, so `stream.feature` scenarios carry `CHART-4` (see live
-prices), plus `NFR-5` for the origin check.
+prices), plus `NFR-5` for the origin check. FinEdge research belongs to the agent area in the PRD
+(`AGENT-15` to `AGENT-20`, `NFR-14`) but has its own `research.feature` file and `@research` tag.
 
 ### PRD requirements without a scenario
 
@@ -336,6 +340,40 @@ test assertions to documented behavior, not a measured line or branch coverage r
 | The database is ready at startup | NFR-8 | `db.py` init_db, _add_missing_columns | not covered |
 | An older database gains the pending approval column | NFR-8 | `db.py` _add_missing_columns | not covered |
 
+### research.feature
+
+| Scenario | Tags | Code | Existing pytest |
+| --- | --- | --- | --- |
+| Saving a FinEdge API key stores it encrypted and returns only a mask | AGENT-15, NFR-14 | `routers/agent.py` finedge_status, finedge_save, `agent/finedge.py` write_key, key_status, mask | partial: test_research.py::test_key_is_encrypted_and_never_returned (updated_at format, cache clear and log line not asserted) |
+| A malformed key is rejected with 422 and nothing is stored | AGENT-15 | `routers/agent.py` FinEdgeKeyBody | partial: test_research.py::test_invalid_keys_are_refused (all 3 rows; status and nothing stored asserted, validation error body not asserted) |
+| The saved key is never returned by any endpoint | AGENT-15, NFR-14 | `routers/agent.py` finedge_status, get_settings, `agent/finedge.py` key_status | partial: test_research.py::test_key_is_encrypted_and_never_returned (PUT body and settings checked; GET /api/agent/finedge after saving and the settings mask not asserted) |
+| Removing the key | AGENT-15 | `routers/agent.py` finedge_remove, `agent/finedge.py` clear_key, clear_cache | partial: test_research.py::test_key_is_encrypted_and_never_returned (response and deleted key asserted; cache clear and log line not asserted) |
+| The key is masked in FinEdge errors and never leaks through network failures | NFR-14 | `agent/finedge.py` get | test_research.py::test_get_sends_the_token_and_masks_it_in_errors, ::test_unreachable_error_does_not_leak_the_key |
+| The FinEdge client retries busy answers and encodes symbols for the URL path | AGENT-16 | `agent/finedge.py` get, path_symbol, RETRY_STATUSES | partial: test_research.py::test_get_sends_the_token_and_masks_it_in_errors (429 only; 5xx retries and delays not tested) |
+| Testing the key reports whether the plan covers all companies or only the sample | AGENT-15, AGENT-20 | `routers/agent.py` finedge_test, `agent/finedge.py` test_key | partial: test_research.py::test_test_key_reports_plan_coverage (both rows, client level), ::test_key_test_route_maps_finedge_answers (route with a stubbed sample result; UI message not covered) |
+| Testing without a saved key returns 409 | AGENT-15 | `routers/agent.py` finedge_test | partial: test_research.py::test_key_test_route_maps_finedge_answers (status only) |
+| FinEdge failures during the key test are mapped without a 401 | AGENT-15 | `routers/agent.py` _finedge_failure, `agent/finedge.py` FinEdgeError.invalid_key | partial: test_research.py::test_key_test_route_maps_finedge_answers, ::test_test_key_raises_for_a_wrong_key (ER006 row only; network and 500 rows not covered) |
+| The settings card saves, then tests the key, and can remove it | AGENT-15 | frontend bundle `AgentConfigPage-*.js` | not covered (no frontend tests) |
+| Research tools are listed and dimmed until a key is saved | AGENT-15, AGENT-16 | frontend bundle `AgentConfigPage-*.js` | not covered (no frontend tests) |
+| The agent gets the research tools and rules only when a key is saved | AGENT-16 | `routers/agent.py` _agent_for, `agent/builder.py` build_agent, RESEARCH_RULES, RESEARCH_OFF_RULE | partial: test_research.py::test_agent_gets_research_tools_only_with_a_key (tool names and research flag; prompt text and tool call limit not asserted) |
+| Financial statements are in Rs crore, oldest period first, with growth | AGENT-16 | `agent/research.py` get_financial_statements | test_research.py::test_statements_are_in_crore_oldest_first_with_growth |
+| Consolidated statements fall back to standalone | AGENT-16 | `agent/research.py` statements | test_research.py::test_statements_fall_back_to_standalone |
+| Statement arguments are validated before any FinEdge call | AGENT-16 | `agent/research.py` get_financial_statements, STATEMENT_PERIODS | test_research.py::test_statement_arguments_are_validated (message prefix only) |
+| Ratios are converted to percent and leverage stays in times | AGENT-16 | `agent/research.py` get_financial_ratios, _pct | test_research.py::test_ratios_are_converted_to_percent |
+| Tool failures are returned to the model as readable text | AGENT-16, AGENT-20 | `agent/research.py` guarded | partial: test_research.py::test_tool_errors_are_readable (outside plan and rejected key rows; 404 and network rows not covered) |
+| Company search puts exact matches first and accepts BSE codes | AGENT-16 | `agent/research.py` search_companies, symbol_master | test_research.py::test_search_puts_exact_matches_first |
+| The company profile trims the description and links the latest annual report | AGENT-16 | `agent/research.py` get_company_profile | test_research.py::test_profile_trims_the_description (length bound, not the exact cut) |
+| Quotes fall back to one by one when a symbol is outside the plan | AGENT-20 | `agent/research.py` quotes, get_stock_quotes | test_research.py::test_quotes_fall_back_to_one_by_one_when_a_symbol_is_outside_the_plan |
+| Peers leave out the company and are ranked by market cap | AGENT-18 | `agent/research.py` get_peers | test_research.py::test_peers_drop_the_company_and_rank_by_market_cap |
+| Comparing companies marks uncovered companies and mixed accounting bases | AGENT-18, AGENT-20 | `agent/research.py` compare_companies | test_research.py::test_compare_companies_marks_uncovered_companies (note presence asserted, not its text) |
+| A comparison needs 2 to 6 companies | AGENT-18 | `agent/research.py` compare_companies, MAX_COMPARE | partial: test_research.py::test_compare_companies_marks_uncovered_companies (one symbol row, prefix only) |
+| Announcements skip routine filings and are sorted newest first | AGENT-16 | `agent/research.py` get_announcements, NOISE | test_research.py::test_announcements_skip_noise_and_sort_newest_first |
+| A research report follows the fixed structure and has no rating unless asked | AGENT-17 | `agent/builder.py` RESEARCH_RULES | not covered (prompt rule, model behaviour) |
+| A comparison answer is one table followed by who leads | AGENT-18 | `agent/builder.py` RESEARCH_RULES | not covered (prompt rule, model behaviour) |
+| A recommendation request without a horizon makes the agent ask for one | AGENT-19 | `agent/builder.py` RESEARCH_RULES | not covered (prompt rule, model behaviour) |
+| A buy or sell research view states the rating and horizon and ends with the disclaimer | AGENT-19 | `agent/builder.py` RESEARCH_RULES | not covered (prompt rule, model behaviour) |
+| On a sample-only plan the agent names the missing data and carries on | AGENT-20 | `agent/builder.py` RESEARCH_RULES, `agent/research.py` guarded | not covered (prompt rule, model behaviour; the tool side is covered above) |
+
 ## Coverage summary
 
 | Feature | Scenarios | Fully covered | Partial | Not covered |
@@ -348,7 +386,8 @@ test assertions to documented behavior, not a measured line or branch coverage r
 | orders | 31 | 1 | 11 | 19 |
 | agent | 60 | 5 | 17 | 38 |
 | platform | 9 | 0 | 1 | 8 |
-| Total | 195 | 22 | 55 | 118 |
+| research | 29 | 11 | 11 | 7 |
+| Total | 224 | 33 | 66 | 125 |
 
 ## Coverage gaps and observations
 
@@ -387,6 +426,12 @@ Gaps in the existing pytest suite, most important first:
    suite (for example Playwright) once the source is recovered.
 9. Platform behaviour (SPA fallback and its path traversal guard, CORS, health, access log
    redaction, schema migration at startup) is untested.
+10. FinEdge research: the tools are tested against a canned FinEdge double, but the research
+    prompt rules (report structure, comparison table, recommendation only when asked, the
+    horizon question, the Buy to Sell rating scale and the closing not-investment-advice
+    line) cannot be checked by pytest and need transcript review or an LLM evaluation. The
+    key test's 502 mappings, 5xx retries, the cache clear on save and remove, and the
+    settings card in the bundle are also untested.
 
 Behaviour observations found while writing the specs (worth a decision, not necessarily
 bugs):
@@ -431,3 +476,8 @@ bugs):
   Starlette test client reports close code 4403.
 * `GET /api/master-contract/status` requires a session, so the login page cannot show
   download progress before login (by design, noted for the PRD).
+* `PUT /api/agent/finedge` stores any well formed key without asking FinEdge. The settings
+  page runs the test right after saving, so a wrong key is saved first and then reported
+  as rejected (PRD open question Q9).
+* FinEdge takes the API key as a `token` query parameter. The client never logs URLs and
+  masks the key in errors, but the key is in every request URL (PRD risk R12).

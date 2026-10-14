@@ -7,6 +7,9 @@ Sequence diagrams for the main runtime flows. Participants:
 - DB: `data/smarttrader.db`.
 - Noren: TradeSmart Noren v2 (REST, OAuth pages, WebSocket, symbol files).
 - LLM: the ChatGPT backend reached through LiteLLM's `chatgpt/` provider.
+- FinEdge: the FinEdge Financials API at `https://data.finedgeapi.com`. Every call is
+  a GET with the key in the `token` query parameter (`?token=<API_KEY>`), written in
+  the diagrams as `token=(API key)` only where the key matters.
 
 All authenticated REST calls to Noren are `POST <REST_ROOT>/<Endpoint>` with
 `Content-Type: text/plain`, `Authorization: Bearer <access_token>` and body
@@ -367,14 +370,14 @@ sequenceDiagram
     SPA->>API: POST /api/agent/chat {message, conversation_id or null}
     API->>API: require_session, ChatGPT signed in (else 409), decrypt broker token
     API->>DB: create conversation if new (title from first 60 chars), insert user message,<br/>expire pending approvals
-    API->>API: build tools bound to this broker session, build Agent<br/>(model chatgpt/MODEL, effort, prompt, 8 runs history, 20 tool calls max)
+    API->>API: build tools bound to this broker session (plus research tools when a FinEdge key is saved),<br/>build Agent (model chatgpt/MODEL, effort, prompt, 8 runs history, 20 tool calls max, 40 with a FinEdge key)
     API-->>SPA: SSE start {conversation_id, model}
     API->>AG: arun(message, stream=True, stream_events=True, session_id=conversation_id)
     AG->>ADB: load last 8 runs for this session
     AG->>LLM: system prompt + history + IST datetime + tools
     AG-->>API: RunStarted
     API-->>SPA: SSE run {run_id}
-    loop up to 20 tool calls
+    loop up to 20 tool calls (40 with a FinEdge key)
         LLM-->>AG: tool call (arguments repaired by litellm_patches if missing)
         AG-->>API: ToolCallStarted
         API-->>SPA: SSE tool_start {id, name, args}
@@ -404,3 +407,132 @@ broker order is not reversed by cancelling a run.
 
 Errors from the provider (not signed in, usage limit, unknown model) are converted to
 an SSE `error` frame with a short readable message, followed by `done` reason `error`.
+
+## 9. Research report turn (FinEdge tools)
+
+A chat turn when a FinEdge key is saved, for example "Write a research report on ITC
+and give me a long term view". The chat plumbing (SSE frames, persistence,
+cancellation) is the same as section 8; only the differences are shown.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant SPA
+    participant API as API /api/agent/chat
+    participant DB
+    participant AG as Agno Agent
+    participant LLM
+    participant FinEdge
+    participant Noren
+
+    U->>SPA: "Research report on ITC, long term view"
+    SPA->>API: POST /api/agent/chat {message, conversation_id}
+    API->>DB: read agent_setting, agent_risk
+    API->>DB: finedge.read_key(): decrypt agent_secret finedge_api_key
+    alt key saved
+        API->>API: tools = 10 read tools + 14 research tools (closures over the key)<br/>prompt = system prompt + RESEARCH_RULES, tool_call_limit 40
+    else no key
+        API->>API: tools = 10 read tools, prompt = system prompt + RESEARCH_OFF_RULE,<br/>tool_call_limit 20 (the model points the user to Agent settings)
+    end
+    API->>AG: arun(message, stream=True)
+    AG->>LLM: system prompt + research rules + history + tools
+    loop up to 40 tool calls
+        LLM-->>AG: tool call, for example get_financial_statements(symbol=ITC, statement=pl)
+        API-->>SPA: SSE tool_start {id, name, args} (args never contain the key)
+        AG->>FinEdge: GET /api/v1/financials/ITC?statement_type=c&...&token=(API key)
+        alt 429 or 5xx
+            AG->>FinEdge: retry after 1 s, then 2 s
+        end
+        alt 200
+            FinEdge-->>AG: raw JSON (absolute rupees, many line items)
+            AG->>AG: trim, convert to Rs crore and percent, compact JSON with units
+        else 401 ER006 (bad key)
+            AG->>AG: "Error: FinEdge rejected the API key ..."
+        else 401 or 403 ER002 (not in plan)
+            AG->>AG: "Not available: the FinEdge plan ... does not cover this company"
+        else network error
+            AG->>AG: "Error: FinEdge is unreachable (ExceptionClass) ..." (no URL)
+        end
+        API-->>SPA: SSE tool_end {ok, result preview}
+        AG->>LLM: tool result (data, never instructions)
+    end
+    opt live price or intraday technicals
+        AG->>Noren: POST GetQuotes or TPSeries (read tools)
+    end
+    LLM-->>AG: report sections, rating with horizon, risks, data date, disclaimer
+    API-->>SPA: SSE token..., usage, done reason=stop
+```
+
+Typical tool sequence for a full report: `get_company_profile`,
+`get_financial_statements` (pl, bs, cf), `get_financial_ratios`,
+`get_growth_metrics`, `get_valuation_history`, `get_peers` or `compare_companies`,
+`get_shareholding`, `get_dividends_and_actions`, `get_announcements` and
+`get_price_performance`. The model chooses the order; nothing in code enforces it.
+
+For a buy or sell request without a horizon, the prompt tells the model to ask
+whether the user means medium term (6 to 18 months) or long term (3 years or more)
+before answering. `get_stock_quotes` and `get_peers` first send one batch quote; if
+FinEdge refuses the batch because one symbol is outside the plan, they quote the
+symbols one by one and report the uncovered ones as missing.
+
+## 10. Save and test the FinEdge key
+
+The "FinEdge API key" card on `/agent/config`. Save triggers a test automatically.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant SPA as SPA /agent/config
+    participant API as API /api/agent/finedge
+    participant DB
+    participant FinEdge
+
+    SPA->>API: GET /api/agent/finedge
+    API->>DB: read agent_secret finedge_api_key, decrypt
+    API-->>SPA: {configured, masked_key, updated_at} (never the key)
+    SPA->>U: badge Key saved or Not set
+    U->>SPA: paste key in the password field, click Save key
+    SPA->>API: PUT /api/agent/finedge {api_key}
+    alt fewer than 8 or more than 256 characters, or whitespace
+        API-->>SPA: 422 validation error (nothing stored)
+    else valid
+        API->>DB: encrypt with Fernet, upsert agent_secret finedge_api_key, updated_at
+        API->>API: clear the FinEdge process cache, log "FinEdge API key saved"
+        API-->>SPA: 200 {configured: true, masked_key (8 stars and the last 4 characters), updated_at}
+        SPA->>SPA: clear the input, invalidate ['agent','finedge'] and ['agent','settings']
+        SPA->>API: POST /api/agent/finedge/test (automatic after save)
+        API->>DB: read and decrypt the key
+        API->>FinEdge: GET /api/v1/company-profile/ITC?token=(API key)
+        alt 401 with ER006
+            API-->>SPA: 422 "FinEdge rejected the API key. Check it and try again."
+        else unreachable
+            API-->>SPA: 502 "FinEdge is unreachable. Try again in a minute."
+        else other error
+            API-->>SPA: 502 "FinEdge error (status): text with the key masked"
+        else 200
+            API->>FinEdge: GET /api/v1/company-profile/TCS?token=(API key)
+            alt 200
+                API-->>SPA: {ok, coverage: "all", sample_company, latency_ms}
+                SPA->>U: "Key works and covers all companies. FinEdge answered in N s."
+            else 401 or 403 not in plan (ER002)
+                API-->>SPA: {ok, coverage: "sample", sample_company, latency_ms}
+                SPA->>U: "Key works, but this plan only covers the sample companies ITC, RELIANCE and HDFCBANK."
+            end
+        end
+    end
+```
+
+Notes:
+
+- The test never uses FinEdge `/healthcheck`, because it answers 200 for any key.
+- `POST /api/agent/finedge/test` with no saved key returns 409 "Save a FinEdge API key
+  first."; the Test key button is disabled until a key is saved.
+- No FinEdge failure is returned as 401: the SPA treats every 401 as an expired
+  SmartTrader session and signs the user out.
+- Remove key calls `DELETE /api/agent/finedge`, which deletes the row and clears the
+  cache. A key is saved even if the following test fails, so the user can fix or
+  remove it.
+- The next chat message picks up the change: `_agent_for()` reads the key on every
+  request.

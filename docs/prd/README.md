@@ -9,7 +9,7 @@ Sources of truth, in order of precedence:
 1. Backend code: `backend/app/routers/*`, `backend/app/broker/*`, `backend/app/agent/*`, `backend/app/models.py`.
 2. Built frontend bundle: `frontend/dist/assets/*.js` (UI strings and API calls were grepped to confirm each screen).
    The frontend source folder (`frontend/src`) exists but is empty, so the bundle is the only UI evidence.
-3. Backend tests: `backend/tests/*` (64 test functions).
+3. Backend tests: `backend/tests/*` (86 test functions, 94 cases with parametrization).
 4. `SPEC.md` (original design spec) and `README.md` (feature summary). Where they differ from the code, the code wins
    and the difference is listed in section 14.
 
@@ -35,11 +35,16 @@ background after every login. From there the user can:
   from position lines), with every action confirmed first;
 - chat with an AI assistant (Agno agent on a ChatGPT subscription via LiteLLM) that reads funds, positions, holdings,
   order and trade books, quotes, history and technicals through the user's own broker session, and that can,
-  only when explicitly switched on, propose real orders that each wait for the user's approval and pass a risk check.
+  only when explicitly switched on, propose real orders that each wait for the user's approval and pass a risk check;
+- with a FinEdge Financials API key saved in Agent settings, ask the same assistant fundamental questions, get a
+  research report on a company from fundamental and price data, compare companies side by side, and, only when
+  asked, get a buy or sell research view for a medium term (6 to 18 months) or long term (3 years or more) horizon
+  that ends with a line saying it is not investment advice.
 
 The application server runs on the user's own machine at `http://127.0.0.1:8000`; broker and model calls use external
-services. API secrets and tokens are stored encrypted in local SQLite and are not returned to the browser. The API
-key is returned by `/api/config`, and the user enters the API secret in the browser during setup.
+services. API secrets, tokens and the FinEdge API key are stored encrypted in local SQLite and are not returned to
+the browser. The TradeSmart API key is returned by `/api/config`, and the user enters the API secret in the browser
+during setup.
 
 ## 2. Problem statement
 
@@ -95,13 +100,18 @@ default, with a human-in-the-loop approval gate and server-side risk limits when
 - G6. Allow order entry, modification, cancellation and square-off from the chart, with explicit confirmation.
 - G7. Provide an AI assistant that is read-only by default and can only trade under human approval and risk limits.
 - G8. Run entirely on the user's machine on a single port.
+- G9. Let the AI assistant do grounded fundamental research (statements, ratios, growth, valuation, peers,
+  shareholding, dividends, filings) with the user's own FinEdge key, quoting every figure from a tool result and
+  marking every buy or sell view as research for education, not investment advice.
 
 ### Non-goals
 
 - NG1. Multi-user or multi-account operation, user management, roles.
 - NG2. Hosting on a server or public network, TLS termination, remote access.
 - NG3. Automated strategy execution, backtesting, scheduled or unattended order placement.
-- NG4. Investment advice, recommendations or signals presented as advice.
+- NG4. Investment advice, recommendations or signals presented as advice. The buy or sell views in AGENT-19 are
+  research views for education: given only when the user asks, never promising a return, and always ending with a
+  not-investment-advice line (see sections 11 and 12).
 - NG5. Support for brokers other than TradeSmart Online.
 - NG6. Mobile apps.
 - NG7. Full order management screens (order book, trade book, positions and holdings pages). These are reachable only
@@ -119,6 +129,8 @@ default, with a human-in-the-loop approval gate and server-side risk limits when
   close position.
 - AI agent: ChatGPT device-code sign-in, model settings, test connection, streaming chat with tool calls, conversation
   history, read-only tools, approval-gated order tools, risk limits, order audit log.
+- Fundamental research in the agent: FinEdge API key save, test and remove on the settings page, 14 read-only
+  research tools, research reports, company comparisons, and medium or long term buy or sell research views.
 - Theming: light and dark mode, accent color.
 - Single-port production serving of the built UI with SPA fallback; development mode with the Vite dev server.
 
@@ -129,6 +141,8 @@ default, with a human-in-the-loop approval gate and server-side risk limits when
 - Market-hours awareness, holiday calendars, alerts and notifications.
 - Watchlists with multiple simultaneous live subscriptions.
 - Exporting data (CSV, reports) and tax or P&L statements.
+- Fundamental data from providers other than FinEdge, stock screeners, alerts on fundamentals, and research reports
+  saved or exported outside the chat transcript.
 
 ---
 
@@ -544,7 +558,8 @@ cannot send an oversized order and I can review my actions later.
 ### 6.6 AI trading agent and its configuration (AGENT)
 
 Verified in: `routers/agent.py`, `agent/builder.py`, `agent/tools.py`, `agent/trading.py`, `agent/chatgpt_auth.py`,
-`agent/litellm_patches.py`, `tests/test_agent.py`; bundles `AgentPage-*.js`, `AgentConfigPage-*.js`, `agent-*.js`.
+`agent/litellm_patches.py`, `agent/research.py`, `agent/finedge.py`, `tests/test_agent.py`, `tests/test_research.py`;
+bundles `AgentPage-*.js`, `AgentConfigPage-*.js`, `agent-*.js`.
 
 **AGENT-1. Sign in with ChatGPT.**
 As an AI-assisted trader, I want to connect my ChatGPT subscription from the settings page, so that the agent runs on
@@ -566,7 +581,8 @@ As an AI-assisted trader, I want to pick a model, a reasoning effort and extra i
 style and plan.
 
 - AC1. `GET /api/agent/settings` lists models LiteLLM knows for `chatgpt/` (default `gpt-5.5` when available),
-  reasoning efforts (low, medium, high, or model default) and the tools.
+  reasoning efforts (low, medium, high, or model default), the tools, the research tools (`research_tools`) and the
+  FinEdge key status (`finedge`, see AGENT-15).
 - AC2. `PUT /api/agent/settings` rejects unknown models and efforts (422); instructions are limited to 4,000 characters.
 - AC3. Extra instructions are appended after the built-in rules. Prompt adherence is not enforced by that ordering;
   order confirmation and the checks in AGENT-11 are enforced separately in the runtime and tools.
@@ -591,7 +607,7 @@ follow and verify the agent's work.
 - AC4. Chat requires ChatGPT sign-in (409 "Sign in with ChatGPT in Agent settings first.") and an active broker
   session.
 - AC5. The agent keeps the last 8 runs of the conversation in context, knows the current IST date and time, and makes
-  at most 20 tool calls per turn.
+  at most 20 tool calls per turn (40 when the research tools are on, see AGENT-16).
 
 **AGENT-5. Read my account and market data safely.**
 As an AI-assisted trader, I want the agent to read live data through my own session, so that its answers are based on
@@ -700,6 +716,119 @@ As an AI-assisted trader, I want model problems explained in plain words, so tha
   Agent settings; other errors are truncated to 400 characters. Network loss shows "The connection to the agent was
   lost."
 
+**AGENT-15. Save and test a FinEdge API key in settings.**
+As an AI-assisted trader, I want to paste my FinEdge Financials API key in Agent settings and check that it works, so
+that the agent can read fundamental data without me editing any file.
+
+- AC1. The settings page has a "FinEdge API key" card ("The key is stored encrypted in the SmartTrader database and is
+  never shown again.") with a "Key saved" or "Not set" badge, a password field ("Paste your FinEdge API key", or
+  "Saved key ********1234" with the mask when a key is stored) and Save key, Test key and Remove key buttons. With no
+  key the hint says "Get a key at finedgeapi.com. The free Basic plan only covers ITC, RELIANCE and HDFCBANK."
+- AC2. `PUT /api/agent/finedge` with `{"api_key": "<FINEDGE_API_KEY>"}` stores the key and returns `configured`,
+  `masked_key` and `updated_at` (IST). A key shorter than 8 characters, longer than 256 characters or containing
+  whitespace is rejected with 422 and nothing is stored. Saving clears the research data cache.
+- AC3. Save key saves the key and then runs the test automatically; Test key runs `POST /api/agent/finedge/test` on
+  the saved key. Saving does not check the key with FinEdge first, so a wrong key is stored and the test that follows
+  reports the rejection.
+- AC4. The test makes two company profile calls: ITC, which every plan covers, and TCS, which needs a paid plan. It
+  returns `ok`, `coverage` (`all` or `sample`), `sample_company` and `latency_ms`. The page shows "Key works and covers
+  all companies. FinEdge answered in N s." or "Key works, but this plan only covers the sample companies ITC, RELIANCE
+  and HDFCBANK."
+- AC5. Testing with no saved key returns 409 "Save a FinEdge API key first.". A key FinEdge rejects (`ER006`) returns
+  422 "FinEdge rejected the API key. Check it and try again.", never 401, because the frontend treats any 401 as an
+  expired SmartTrader session. Unreachable FinEdge returns 502 "FinEdge is unreachable. Try again in a minute."; other
+  FinEdge errors return 502 "FinEdge error (<status>): <message>". The page shows failures under "Test failed".
+- AC6. `DELETE /api/agent/finedge` removes the key and clears the cache; `GET /api/agent/finedge` and the `finedge`
+  field of `GET /api/agent/settings` report the status. The Tools card lists the research tools, dimmed with
+  "(needs a FinEdge key)" until a key is saved.
+
+**AGENT-16. Ask fundamental questions.**
+As an AI-assisted trader, I want to ask the agent about a company's financials, ratios, growth, valuation,
+shareholding, dividends and filings, so that I understand the business behind the price.
+
+- AC1. With a FinEdge key saved, each chat turn adds 14 read-only research tools: `search_companies`,
+  `get_company_profile`, `get_financial_statements`, `get_financial_ratios`, `get_growth_metrics`,
+  `get_stock_quotes`, `get_price_performance`, `get_valuation_history`, `get_peers`, `compare_companies`,
+  `get_shareholding`, `get_dividends_and_actions`, `get_announcements` and `get_index_overview`. The prompt adds the
+  research rules and the tool call limit rises from 20 to 40 per turn.
+- AC2. Without a key the research tools are not given to the model, and the prompt tells it to say that a FinEdge API
+  key can be added in Agent settings when the user asks for fundamentals, a report, a comparison or a recommendation.
+- AC3. The tools are closures over the key; the key never appears in prompts, tool arguments or tool results.
+  FinEdge symbols are NSE symbols or BSE codes with no exchange; `search_companies` matches a name, NSE symbol or BSE
+  code with exact matches first (up to 25 rows).
+- AC4. Units are converted for the model: statements in Rs crore, oldest period first, with EPS in rupees and revenue
+  and profit growth in percent (year on year for quarterly rows); ratios, growth rates, margins and returns in
+  percent; multiples in times. Every result states whether figures are consolidated or standalone, and consolidated
+  requests fall back to standalone when a company has no consolidated accounts.
+- AC5. `get_valuation_history` gives PE, PB, price to sales and price to free cash flow by year and today's percentile
+  in the daily range since 2018; `get_price_performance` gives returns, CAGR, 1 year volatility, maximum drawdown, 50
+  and 200 day averages and benchmark index returns; `get_announcements` drops routine filings (trading window, share
+  certificate and newspaper notices) and lists the rest newest first with PDF links. FinEdge quotes are delayed 15 to
+  30 minutes; live prices still come from the TradeSmart tools.
+- AC6. The prompt requires every figure to be quoted from a tool result with its unit and period. Tool failures come
+  back as readable text: a rejected key points to Agent settings, a 404 suggests `search_companies`, and other errors
+  carry FinEdge's short message without the key.
+
+**AGENT-17. Get a research report on a company.**
+As an AI-assisted trader, I want a structured research report on a company built from fundamental and price data, so
+that I get a complete picture in one answer.
+
+- AC1. The report follows the structure in the research rules: summary, business, financial performance over 5 years,
+  profitability and returns, balance sheet and cash flow, valuation against its own history and its peers,
+  shareholding, dividends, recent filings, key risks, conclusion.
+- AC2. Figures are fetched in the same turn and quoted with units and periods (financial years end in March); the
+  report states the accounting basis and does not mix consolidated and standalone figures.
+- AC3. The report has no buy or sell rating unless the user asks for one (AGENT-19).
+- AC4. The structure is a prompt rule. Model compliance is not enforced by code or tested.
+
+**AGENT-18. Compare companies.**
+As an AI-assisted trader, I want to compare the fundamentals of two to six companies, so that I can see who leads on
+growth, profitability, balance sheet strength and valuation.
+
+- AC1. `compare_companies` takes 2 to 6 symbols ("Error: give between 2 and 6 symbols." otherwise) and returns per
+  company: name, industry, basis, latest financial year, revenue and net profit in Rs crore, 3 and 5 year revenue
+  CAGR, 3 year profit and EPS CAGR, 3 year average dividend payout, EBITDA and net margin, ROE, ROCE, debt to equity,
+  PE, PB, price and market cap.
+- AC2. A company the plan does not cover stays in the list with `error` "not covered by this FinEdge plan" (or "not
+  found"), and the other companies are still compared.
+- AC3. When some companies report consolidated and others standalone figures, the result carries the note "Mixed
+  consolidated and standalone figures: compare with care."
+- AC4. `get_peers` lists peers in the same sub-industry, industry, sector or macro sector, without the company itself,
+  ranked by market cap (peers with no quote last).
+- AC5. The answer shows one table with a row per metric and a column per company, then explains who leads on growth,
+  profitability, balance sheet strength and valuation (prompt rule, not tested).
+
+**AGENT-19. Get a buy or sell research view for a medium or long term horizon.**
+As an AI-assisted trader, I want a buy or sell view on a company for a medium term (6 to 18 months) or long term (3
+years or more) horizon, so that I can weigh a decision with the evidence laid out.
+
+- AC1. The agent gives a recommendation only when the user asks. When no horizon is given it asks whether the user
+  means medium term (6 to 18 months) or long term (3 years or more).
+- AC2. Medium term weighs recent quarterly earnings momentum, the price trend against the 50 and 200 day averages, the
+  valuation percentile and near-term catalysts in filings. Long term weighs 5 year growth, return on equity and
+  capital, cash conversion, debt, dividend record and valuation against history.
+- AC3. The view states a rating (Buy, Accumulate, Hold, Reduce or Sell) with the horizon, then the thesis, supporting
+  numbers, a valuation view with the method used, risks, what would change the view, and the data date. It never
+  promises a return.
+- AC4. It ends with: "This is a research view for education, not investment advice. Consult a SEBI registered
+  investment adviser before investing."
+- AC5. A research view never places an order; order tools still need trading on and per-order approval (AGENT-8,
+  AGENT-10).
+- AC6. AC1 to AC4 are prompt rules. No test asserts model compliance.
+
+**AGENT-20. Research with a sample-only FinEdge plan.**
+As an AI-assisted trader on the free FinEdge plan, I want research to work for the companies my plan covers and to
+tell me plainly what is missing, so that a partial plan does not break the answer.
+
+- AC1. The key test reports `coverage` `sample` when FinEdge refuses the TCS profile with a 401 or 403 that is not an
+  invalid key, and the settings page names the sample companies ITC, RELIANCE and HDFCBANK.
+- AC2. A tool call for a company or data set outside the plan returns "Not available: the FinEdge plan on this API key
+  does not cover this company or data. The free Basic plan only covers ITC, RELIANCE and HDFCBANK."
+- AC3. FinEdge refuses a whole quote batch when one symbol is outside the plan; `get_stock_quotes` then quotes each
+  symbol on its own and lists the uncovered ones under `not_found`.
+- AC4. `compare_companies` keeps uncovered companies with an error (AGENT-18 AC2), and the prompt tells the model to
+  say which data is missing and carry on with the rest.
+
 ### 6.7 Theming and UX (UX)
 
 Verified in: bundle `index-*.js` (theme store `smarttrader-theme`, accents, routes), `main.py` (SPA fallback).
@@ -784,14 +913,22 @@ are available. Error, paused and cancelled turns may have no usage metrics; empt
 **NFR-11. Compatibility.** Python 3.14 with uv, FastAPI 0.143.0, uvicorn 0.54.0, SQLAlchemy 2, Node 24, React 19.3,
 TypeScript 7, Vite 8, Tailwind 4, Agno and LiteLLM. The schema self-migrates added columns at startup.
 
-**NFR-12. Testability.** The backend suite contains 64 test functions (69 parametrized cases) across auth callback, checksum, funds,
-history, master contract parsing, orders, order service, stream relay and the agent (including approval pause and
-resume). This is selective coverage, not coverage of every requirement; see `docs/bdd/README.md` for explicit gaps.
+**NFR-12. Testability.** The backend suite contains 86 test functions (94 parametrized cases) across auth callback, checksum, funds,
+history, master contract parsing, orders, order service, stream relay, the agent (including approval pause and
+resume) and the FinEdge research tools (`tests/test_research.py`, run against canned FinEdge answers). This is selective coverage, not coverage of every requirement; see `docs/bdd/README.md` for explicit gaps.
 The approval test uses a fake agent and does not execute an approved order tool. There are no frontend tests.
 
 **NFR-13. Market-hours awareness (Not implemented).** The app should know NSE, BSE and MCX session times and exchange
 holidays, label the chart and order ticket when the market is closed, and explain empty history accordingly. Today
 there is no market-hours or holiday logic anywhere; the broker alone decides.
+
+**NFR-14. FinEdge API key security.** The FinEdge key is entered only on the Agent settings page and stored
+Fernet-encrypted in `agent_secret` (row `finedge_api_key`), never in `.env` or any other file. No endpoint returns it:
+the API gives only `configured`, a mask of eight asterisks plus the last 4 characters, and `updated_at`. FinEdge takes
+the key as a `token` query parameter, so request URLs are not logged (httpx logging is at WARNING), the key is
+replaced with `***` in FinEdge error text, and network failures are reported by exception class only. The key lives
+in tool closures, never in prompts, tool arguments or tool results. Saving and removing log only "FinEdge API key
+saved" or "FinEdge API key removed". A rejected key answers 422, never 401, so it cannot sign the user out.
 
 ## 8. Constraints and assumptions
 
@@ -807,6 +944,8 @@ there is no market-hours or holiday logic anywhere; the broker alone decides.
 - C6. TradeSmart refuses MARKET-type orders from the API; the app depends on market price protection.
 - C7. The AI agent requires a ChatGPT Plus, Pro or Team subscription; model availability depends on the plan.
 - C8. The symbol master is refreshed on login or on demand only.
+- C9. Fundamental research needs the user's own FinEdge Financials API key. What it can see depends on the FinEdge
+  plan: the free Basic plan covers only ITC, RELIANCE and HDFCBANK. FinEdge quotes are delayed 15 to 30 minutes.
 
 ## 9. Dependencies
 
@@ -820,6 +959,7 @@ there is no market-hours or holiday logic anywhere; the broker alone decides.
 | Agno | Agent runtime, tool confirmation, session history (`data/agent.db`) | |
 | openalgo-charts | Chart rendering, indicators, drawings, trading lines | Frontend library |
 | OpenAlgo TradeSmart plugin (reference only) | Symbol conventions, funds and protection logic | Logic ported, not a runtime dependency |
+| FinEdge Financials API (`https://data.finedgeapi.com`) | Research tools: company profile and reports, financial statements, ratios, financial metrics, price ratios, daily quotes, quotes, peers, shareholding, corporate actions, filings, index data, stock symbols | User's own API key as `token` query parameter; the plan decides company coverage; 30 s timeout, two retries on 429 and 5xx |
 
 ## 10. Success metrics
 
@@ -835,6 +975,7 @@ there is no market-hours or holiday logic anywhere; the broker alone decides.
 | Unapproved agent orders | Zero | `agent_order_audit`: every `placed` row preceded by `approved` |
 | Agent risk refusals honoured | 100% of refusals send no order mutation; quote or book reads may already have occurred | Broker mutation test doubles and audit rows |
 | Agent answer grounding | No answer quotes a price without a tool call in the same turn | Transcript review of `agent_message.tools_json` |
+| Research disclaimer | 100% of buy or sell research views end with the not-investment-advice line | Transcript review of research turns |
 
 ## 11. Risks and open questions
 
@@ -856,6 +997,17 @@ there is no market-hours or holiday logic anywhere; the broker alone decides.
 - R8. ChatGPT plan limits or model withdrawal can make the agent unavailable; LiteLLM's stream bridge is patched
   locally (`litellm_patches.py`) and may break on LiteLLM upgrades.
 - R9. Daily agent order limit counts only `place_order`; modifications and cancellations are not counted.
+- R10. Research views are not advice. AGENT-19 produces Buy, Accumulate, Hold, Reduce or Sell ratings that a user may
+  read as advice. Mitigated by giving them only on request, asking for the horizon, showing the evidence and method,
+  never promising a return and ending with the not-investment-advice line. These are prompt rules, not enforced by
+  code or tests, and the model can still state a wrong figure or skip the disclaimer.
+- R11. FinEdge plan coverage. On a sample-only plan most companies return "Not available", so reports and
+  comparisons can be partial. Mitigated by the coverage result of the key test, per-company errors in
+  `compare_companies` and the rule to name missing data. FinEdge data can also lag filings, and its quotes are
+  delayed 15 to 30 minutes.
+- R12. The FinEdge key travels in the request URL as a query parameter. Mitigated by keeping httpx logging at
+  WARNING, masking the key in error text and never echoing URLs (NFR-14); a proxy or debugging tool that logs URLs
+  would still see it.
 
 ### Open questions
 
@@ -870,12 +1022,17 @@ there is no market-hours or holiday logic anywhere; the broker alone decides.
 - Q7. Is the duplicate-order guard (same symbol, exchange, side and quantity within 60 s, price ignored) the right
   rule, and should it apply to chart orders?
 - Q8. Should the agent `modify_order` check allowed exchanges (it currently does not)?
+- Q9. Should `PUT /api/agent/finedge` test the key with FinEdge before storing it, instead of storing it and testing
+  afterwards?
 
 ## 12. Regulatory and compliance notes
 
 - No investment advice. SmartTrader is a personal tool. The agent must add a line that any opinion on a trade is not
   investment advice; the UI says "It can make mistakes." The product must not be marketed as an advisory or research
-  service. Under SEBI rules, investment advice and research analysis require registration.
+  service. Under SEBI rules, investment advice and research analysis require registration. The FinEdge research
+  views (AGENT-19) are produced only on the user's request, for the user's own use, and end with "This is a research
+  view for education, not investment advice. Consult a SEBI registered investment adviser before investing." They
+  must not be published, shared as recommendations or offered to other people.
 - Order safety. Every chart order, modification, cancellation and square-off requires an explicit click; every agent
   order action requires explicit approval and passes server-side checks. Agent trading is off by default and needs an
   explicit acknowledgment to enable.
@@ -955,6 +1112,12 @@ Not implemented (identified need with no code).
 | AGENT-12 | Order audit log | Implemented | |
 | AGENT-13 | Built-in behaviour rules | Implemented | |
 | AGENT-14 | Readable model errors | Implemented | |
+| AGENT-15 | Save and test a FinEdge API key | Implemented | Save stores the key before testing it; not in SPEC |
+| AGENT-16 | Fundamental questions with research tools | Implemented | 14 tools only with a key; not in SPEC |
+| AGENT-17 | Company research report | Implemented | Report structure is a prompt rule, not tested; not in SPEC |
+| AGENT-18 | Company comparison | Implemented | Not in SPEC |
+| AGENT-19 | Buy or sell research view, medium or long term | Implemented | Horizon question and disclaimer are prompt rules, not tested; not in SPEC |
+| AGENT-20 | Research on a sample-only FinEdge plan | Implemented | Not in SPEC |
 | UX-1 | Light and dark mode | Implemented | Follows OS until chosen |
 | UX-2 | Accent color | Implemented | Not in SPEC |
 | UX-3 | Loading, error and retry states | Implemented | |
@@ -964,6 +1127,7 @@ Not implemented (identified need with no code).
 | NFR-2 to NFR-11 | Non-functional requirements | Implemented | Implementation mechanisms in section 7; runtime limits and test gaps still apply |
 | NFR-12 | Testability | Partial | Backend tests only; no frontend tests; frontend source missing |
 | NFR-13 | Market-hours awareness | Not implemented | No market-hours or holiday checks anywhere |
+| NFR-14 | FinEdge API key security | Implemented | Key sent as a URL query parameter by FinEdge's design (R12) |
 
 ## 14. SPEC.md versus the code
 
@@ -997,4 +1161,6 @@ Not implemented (identified need with no code).
 - Agent: test connection with latency, conversation date grouping, starter prompts, reasoning display, usage and time
   to first token, acknowledgment checkbox to enable trading, kill-switch semantics, pending approvals expiring on a
   new message, readable provider error mapping, LiteLLM stream bridge patch.
+- Agent fundamental research with a FinEdge API key: key card in settings, 14 research tools, research reports,
+  company comparisons and buy or sell research views (AGENT-15 to AGENT-20, NFR-14).
 - OAuth code redaction in the access log; schema self-migration of added columns.

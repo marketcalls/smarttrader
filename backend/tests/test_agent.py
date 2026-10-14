@@ -9,7 +9,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app import crypto
-from app.agent import chatgpt_auth, trading, tools as agent_tools
+from app.agent import chatgpt_auth, finedge, trading, tools as agent_tools
 from app.deps import get_db, hash_session_value
 from app.main import app
 from app.models import AgentMessage, AuthSession, Base
@@ -22,7 +22,7 @@ def env(tmp_path, monkeypatch):
     Base.metadata.create_all(engine)
     TestSession = sessionmaker(bind=engine, expire_on_commit=False)
     monkeypatch.setattr(crypto, "_fernet", Fernet(Fernet.generate_key()))
-    for module in (chatgpt_auth, agent_tools, agent_router, trading):
+    for module in (chatgpt_auth, finedge, agent_tools, agent_router, trading):
         monkeypatch.setattr(module, "SessionLocal", TestSession)
 
     def override_db():
